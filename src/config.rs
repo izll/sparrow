@@ -145,6 +145,18 @@ pub struct BPExplorationConfig {
     /// How many different scatter targets are tried before falling back to the least dense bin
     /// again. Consecutive attempts use the 1st, 2nd, ... least dense open layout as the bin to close.
     pub n_scatter_retries: usize,
+    /// **Area-based feasibility bound** on the bin-count reduction.
+    ///
+    /// Before attempting to eliminate a bin, the exploration phase computes the density the
+    /// remaining `n - 1` *densest* bins would have to reach to hold all the placed item area. If
+    /// that required density exceeds this cap, the reduction is provably (area-wise) hopeless or
+    /// hopelessly unlikely, and the phase returns immediately instead of burning its whole budget
+    /// on impossible attempts.
+    ///
+    /// * `1.0` = pure area bound (only mathematically impossible reductions are skipped),
+    /// * `0.90` (default) = also skip reductions that would need a nesting density above 90 %,
+    ///   which is out of reach for irregular parts in practice.
+    pub max_reduction_density: f32,
 }
 
 /// Configuration of the BPP compression phase ([`crate::optimizer::bpp::compress::compression_phase`]).
@@ -160,6 +172,22 @@ pub struct BPCompressionConfig {
     /// Configuration of the *strip packing* sub-optimization used for the consolidation.
     /// Its `time_limit` acts as the budget for a single consolidation attempt.
     pub consolidation_expl_cfg: ExplorationConfig,
+    /// Whether to run the **pack-down** step before the strip consolidation:
+    /// repeatedly try to move items out of the least dense bin into the other (denser) bins, so
+    /// the leftover material concentrates in a single bin (which may even empty out completely,
+    /// reducing the bin count).
+    pub pack_down: bool,
+    /// Wall-clock budget for a single pack-down move attempt (one item into one destination bin).
+    /// This caps the `separate()` call that has to "make room" for the newcomer.
+    pub pack_down_move_time_limit: Duration,
+    /// Fraction of the compression phase's budget the pack-down step may use at most. The rest is
+    /// reserved for the strip consolidation that follows it, which is what actually turns the
+    /// emptied bin's remainder into a single offcut.
+    pub pack_down_time_ratio: f32,
+    /// Separator configuration used by the pack-down step. Deliberately much cheaper than the
+    /// exploration one: a pack-down attempt is a *local* repair (one extra item in one bin), and
+    /// hundreds of them are made, so few iterations and few strikes per attempt.
+    pub pack_down_separator_config: SeparatorConfig,
 }
 
 /// The BPP counterpart of [`DEFAULT_SPARROW_CONFIG`]: identical separator, sampling and geometry
@@ -173,6 +201,7 @@ pub const DEFAULT_BPP_CONFIG: BPConfig = BPConfig {
         solution_pool_distribution_stddev: 0.25,
         large_item_ch_area_cutoff_percentile: 0.75,
         n_scatter_retries: 3,
+        max_reduction_density: 0.90,
     },
     cmpr_cfg: BPCompressionConfig {
         time_limit: Duration::from_secs(60),
@@ -186,6 +215,16 @@ pub const DEFAULT_BPP_CONFIG: BPConfig = BPConfig {
             solution_pool_distribution_stddev: 0.25,
             separator_config: DEFAULT_SPARROW_CONFIG.cmpr_cfg.separator_config,
             large_item_ch_area_cutoff_percentile: 0.75,
+        },
+        pack_down: true,
+        pack_down_move_time_limit: Duration::from_secs(2),
+        pack_down_time_ratio: 0.6,
+        pack_down_separator_config: SeparatorConfig {
+            iter_no_imprv_limit: 50,
+            strike_limit: 2,
+            log_level: log::Level::Debug,
+            n_workers: DEFAULT_SPARROW_CONFIG.cmpr_cfg.separator_config.n_workers,
+            sample_config: DEFAULT_SPARROW_CONFIG.cmpr_cfg.separator_config.sample_config,
         },
     },
     cde_config: DEFAULT_SPARROW_CONFIG.cde_config,

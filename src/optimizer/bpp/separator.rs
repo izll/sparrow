@@ -219,6 +219,12 @@ impl BPSeparator {
     /// all trackers are rebuilt from the layouts — the snapshots can no longer be trusted to line
     /// up by key. Otherwise, and only if tracker snapshots were provided, the losses are restored
     /// per layout while **keeping** the GLS weights (they are the search's long-term memory).
+    ///
+    /// A tracker's GLS weights can only be kept when its *shape* still matches: `restore_but_keep_weights`
+    /// copies the snapshot's losses into the live tracker's (pre-sized) pair matrix, so the live
+    /// tracker must hold exactly as many items as the snapshot does. Cross-layout moves
+    /// ([`Self::transfer_item`]) change item counts **without** changing layout keys, so the size is
+    /// checked per layout and mismatching trackers are rebuilt from the snapshot instead.
     pub fn rollback(&mut self, sol: &BPSolution, cts: Option<&SecondaryMap<LayKey, CTSnapshot>>) {
         let layout_keys_changed = self.prob.restore(sol);
 
@@ -234,10 +240,17 @@ impl BPSeparator {
                 for (lkey, cts) in cts.iter() {
                     let layout = &self.prob.layouts[lkey];
                     match self.trackers.get_mut(lkey) {
-                        //if a snapshot of the tracker was provided, restore it
-                        Some(ct) => ct.restore_but_keep_weights(cts, layout),
-                        //no tracker for this (new) layout yet, adopt the snapshot as-is
-                        None => {
+                        // A snapshot of the tracker was provided and it has the same number of
+                        // items: restore the losses but keep the (long-term memory) GLS weights.
+                        Some(ct) if ct.size == cts.size && cts.size == layout.placed_items.len() => {
+                            ct.restore_but_keep_weights(cts, layout)
+                        }
+                        // Either there is no tracker for this layout yet, or the item count changed
+                        // (a cross-layout move). Adopt the snapshot as-is: it is by construction the
+                        // tracker of exactly this layout state, weights included.
+                        _ => {
+                            debug_assert!(cts.size == layout.placed_items.len(),
+                                "the tracker snapshot must match the restored layout");
                             self.trackers.insert(lkey, cts.clone());
                         }
                     }
@@ -286,11 +299,88 @@ impl BPSeparator {
         new_pk
     }
 
+    /// Moves an item **out of one layout and into another**, at a random feasible position inside
+    /// the destination container.
+    ///
+    /// This is the transactional cross-layout primitive the pack-down step
+    /// ([`crate::optimizer::bpp::compress::pack_down`]) is built on. It embraces jagua-rs'
+    /// auto-close semantics rather than fighting them:
+    ///
+    /// * removing the last item of `src` closes that layout and returns its bin to stock — which
+    ///   is precisely the outcome the pack-down step is hoping for (one bin fewer);
+    /// * the destination is always non-empty (it is a different, open layout), so `dst` keeps its
+    ///   key across the placement.
+    ///
+    /// The trackers of both touched layouts are rebuilt (GLS weights reset for those two only, the
+    /// weights of untouched layouts survive), and the workers are reseeded from the new state.
+    ///
+    /// Returns `(new_pk, src_closed)`; `None` if the item does not fit inside the destination
+    /// container in any allowed rotation (in which case **nothing is changed**).
+    pub fn transfer_item(&mut self, src: LayKey, pk: PItemKey, dst: LayKey) -> Option<(PItemKey, bool)> {
+        debug_assert!(src != dst, "transfer_item is for cross-layout moves only");
+        debug_assert!(self.prob.layouts.contains_key(src) && self.prob.layouts.contains_key(dst));
+
+        let item_id = self.prob.layouts[src].placed_items[pk].item_id;
+        let item = self.instance.item(item_id);
+        let dst_bbox = self.prob.layouts[dst].container.outer_cd.bbox;
+
+        // Sample a random (feasible-rotation) position anywhere inside the destination container.
+        // Bail out *before* touching the problem if the item cannot fit there at all.
+        let sampler = UniformBBoxSampler::new(dst_bbox, item, dst_bbox)?;
+        let d_transf = sampler.sample(&mut self.rng);
+
+        // 1. Remove from the source. This may auto-close the (now empty) source layout.
+        self.prob.remove_item(src, pk);
+        let src_closed = !self.prob.layouts.contains_key(src);
+        if src_closed {
+            self.trackers.remove(src);
+        }
+
+        // 2. Place into the destination, which is guaranteed to stay open (it was non-empty).
+        let (new_lkey, new_pk) = self.prob.place_item(BPPlacement {
+            layout_id: BPLayoutType::Open(dst),
+            item_id,
+            d_transf,
+        });
+        debug_assert!(new_lkey == dst, "the destination layout must keep its key");
+
+        // 3. Rebuild the trackers of the (at most two) touched layouts and resync the workers.
+        if !src_closed {
+            let ct = CollisionTracker::new(&self.prob.layouts[src]);
+            debug_assert!(tracker_matches_layout(&ct, &self.prob.layouts[src]));
+            self.trackers.insert(src, ct);
+        }
+        let ct = CollisionTracker::new(&self.prob.layouts[dst]);
+        debug_assert!(tracker_matches_layout(&ct, &self.prob.layouts[dst]));
+        self.trackers.insert(dst, ct);
+        self.reseed_workers();
+
+        debug_assert!(self.trackers.len() == self.prob.layouts.len());
+        debug_assert!(self.prob.layouts.iter().all(|(lkey, l)| tracker_matches_layout(&self.trackers[lkey], l)));
+
+        Some((new_pk, src_closed))
+    }
+
     /// Rebuilds all collision trackers from the current layouts. GLS weights are reset to 1.0.
     pub fn rebuild_trackers(&mut self) {
         self.trackers = self.prob.layouts.iter()
             .map(|(lkey, l)| (lkey, CollisionTracker::new(l)))
             .collect();
+    }
+
+    /// Swaps in a different [`SeparatorConfig`] (returning the previous one) and reseeds the workers
+    /// so they pick up the new `sample_config`.
+    ///
+    /// Used by the pack-down step in [`crate::optimizer::bpp::compress`], which runs *many* short
+    /// separations and therefore wants a much cheaper separator than the surrounding phase.
+    /// Note that `n_workers` is **not** applied retroactively: the worker vector (and the thread
+    /// pool) are sized at construction time, so only the iteration limits and the sample config
+    /// take effect.
+    pub fn swap_config(&mut self, config: SeparatorConfig) -> SeparatorConfig {
+        let old = self.config;
+        self.config = config;
+        self.reseed_workers();
+        old
     }
 
     /// Rebuilds the workers from the master's current state (fresh RNG seeds from the master RNG).

@@ -156,11 +156,86 @@ back into that layout (offset by the container bbox origin) — only if the resu
 
 ---
 
-## Status (2026-08-17)
+## Status (2026-08-18)
 
-Phases 1–3 are complete. `cargo test` is green (15 tests: 3 SPP integration + 12 BPP), `cargo clippy
---all-targets` is clean for all BPP files, and `cargo build --release` (also with `--features
+Phases 1–**4** are complete. `cargo test` is green (18 tests: 3 SPP integration + 15 BPP), `cargo
+clippy --all-targets` is clean for all BPP files (the only two remaining warnings are pre-existing
+`collapsible_if`s in the SPP `separator.rs`), and `cargo build --release` (also with `--features
 only_final_svg`) succeeds.
+
+### Phase 4 — cross-layout consolidation ("pack-down")
+
+The problem phase 4 solved: on the real 112-part instance the exploration phase burned its entire
+budget on 4 → 3 reductions that are *area-infeasible* (3 bins of 2000x1000 would need 94.3 % density),
+and because every move was intra-layout, the slack stayed spread evenly over all four bins (65.9 /
+66.1 / 75.0 / 75.9 %). The SPP pipeline on the same parts concentrates the remainder at the end of the
+strip; the BPP pipeline had no way to.
+
+| Item | Where |
+| --- | --- |
+| Area bound `required_density_for_reduction` + early return | `src/optimizer/bpp/explore.rs` |
+| `max_reduction_density` (default 0.90) | `src/config.rs` (`BPExplorationConfig`) |
+| Unused exploration time handed to compression | `src/optimizer/bpp/mod.rs` |
+| `pack_down` — cross-layout item migration out of the sparsest bin | `src/optimizer/bpp/compress.rs` |
+| `compression_phase` — pack-down ⇄ consolidation alternation with convergence check | `src/optimizer/bpp/compress.rs` |
+| `BPSeparator::transfer_item` — the transactional cross-layout primitive phases 1–3 deferred | `src/optimizer/bpp/separator.rs` |
+| `BPSeparator::swap_config` — cheap separator for the many short pack-down separations | `src/optimizer/bpp/separator.rs` |
+| `pack_down`, `pack_down_time_ratio`, `pack_down_move_time_limit`, `pack_down_separator_config` | `src/config.rs` (`BPCompressionConfig`) |
+| `-p` tie-break: lowest density of the least dense bin | `src/bpp_main.rs` (`min_bin_density`) |
+| `-x` also lowers the pack-down budgets | `src/bpp_main.rs` |
+| Tests: pack-down effect, area bound fires, area bound for a single bin | `tests/bpp_packdown_tests.rs` |
+
+Measured effect (`-e 30 -c 20 -s 42`, both bin sizes; see `docs/bpp.md` for the full table):
+
+| Instance | Least dense bin | Used width of that bin |
+| --- | --- | --- |
+| 112 parts, `--bin 2000x1000` | 65.9 % → **41.9 %** | 1985 → **1308** of 2000 |
+| 112 parts, `--bin 3000x1500` | 54.6 % → **45.1 %** | 2124 → **1534** of 3000 |
+| `swim`, `--bin 3200x3200` (`-e 10 -c 25 -s 0`) | 48.8 % → **29.9 %** | — |
+
+Exploration now returns in < 0.1 s on both (instead of 30 s), and the freed budget goes to compression.
+
+#### Bug found and fixed in phase 4
+
+`BPSeparator::rollback` restored a tracker snapshot with `restore_but_keep_weights` whenever the
+*layout keys* were unchanged. That copies losses into the live tracker's **pre-sized** pair matrix, so
+it is only valid when the item *count* is also unchanged. Cross-layout moves change item counts
+without changing keys, which made the rollback index out of bounds
+(`quantify/pair_matrix.rs:43: assertion failed: row < size && col < size`). `rollback` now compares
+sizes per layout and adopts the snapshot wholesale (weights included) when they differ. The bug was
+latent in phases 1–3 — nothing there could produce a same-key, different-size rollback — but the guard
+is general.
+
+#### Phase 4 design decisions
+
+* **Pack-down lives in the compression phase, not the exploration one.** It is a *secondary*-objective
+  step (concentrate the slack), even though it can reduce the bin count as a side effect. Putting it in
+  compression keeps the phase contract intact: exploration is where the bin count is *targeted*.
+* **The pack-down / consolidation alternation.** A single pass wasted the tail of the budget (the
+  consolidation converges in seconds once the bin is sparse). They now alternate until a round changes
+  nothing, so a leftover budget keeps being useful, and consolidation freeing a contiguous block
+  occasionally lets the next pack-down round evict one more item.
+* **`pack_down_time_ratio` (0.6).** Without it pack-down ate the whole budget and the consolidation —
+  the step that actually turns the emptied bin into *one* offcut — never ran.
+* **The area bound uses the `n-1` **largest** containers.** That is the optimistic choice, so a value
+  above the cap is a genuine "cannot", not an artefact of picking the wrong bins to keep. With
+  homogeneous bins it makes no difference; with heterogeneous stock it avoids false negatives.
+* **A freshly transferred item gets a `search_placement` pass before `separate()`.** Dropping it at the
+  random sampled position and relying on the GLS loop alone wasted most of the (short) per-move budget
+  climbing out of a bad start.
+* **Both touched layouts' trackers are rebuilt on a transfer** (GLS weights reset for those two only).
+  Migrating weights across a changed pair-matrix size is not meaningful, and the untouched layouts keep
+  their long-term memory.
+
+#### Phase 4 deviations from the task description
+
+* **`pack_down` returns `(BPSolution, usize)`** rather than just the solution: the alternation loop
+  needs to know whether anything moved to decide convergence.
+* **`pack_down_time_ratio` was added** (not in the spec) — see above.
+* **The compression phase alternates the two steps** instead of running pack-down once and then
+  consolidating once.
+* **The `-x` flag also lowers `pack_down_move_time_limit` and the pack-down separator limits**, as the
+  spec suggested it "may".
 
 ### Implemented as specified
 
@@ -214,9 +289,11 @@ RNGs derived from the master, no `HashMap` iteration, and `debug_assert!`s mirro
 
 ### Deferred
 
-* **Cross-layout moves during separation** (spec called them "a later extension"). Requires a
-  transactional remove/place helper because `remove_item` auto-closes single-item layouts, invalidating
-  `LayKey`s and changing the bin count mid-move. Hook documented in `worker::move_items`.
+* **Cross-layout moves *inside the GLS separation loop*.** ~~Requires a transactional remove/place
+  helper~~ — that helper now exists (`BPSeparator::transfer_item`, phase 4) and is used by the
+  pack-down step, but the *workers* still move items only within their own layout. The remaining
+  obstacle is the merge: a worker holds a private problem copy and merges by key, so an auto-close
+  inside a worker changes the master's key space. Hook documented in `worker::move_items`.
 * **Cross-layout disruption swaps** — same reason.
 * **Iteration-based terminator** for the determinism smoke test the spec asked for. Only a wall-clock
   terminator exists, so two same-seed runs complete a different number of iterations and a strict

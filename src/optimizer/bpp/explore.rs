@@ -74,6 +74,17 @@ pub fn exploration_phase(
             break;
         }
 
+        // --- Area bound ---------------------------------------------------------------------
+        // A reduction to `n - 1` bins can only exist if the placed item area fits into the `n - 1`
+        // *largest* remaining containers at a density the nesting can realistically reach. If it
+        // cannot, every attempt below is doomed: return instead of spinning until the timeout.
+        let required_density = required_density_for_reduction(sep);
+        if required_density > config.max_reduction_density {
+            info!("[BPEXPL] reduction to {} bins needs {:.1}% density > cap, skipping exploration",
+                sep.prob.layouts.len() - 1, required_density * 100.0);
+            break;
+        }
+
         // Vary the target across retries: the 1st, 2nd, ... least dense bin. This makes consecutive
         // attempts genuinely different subproblems instead of re-runs of the same one.
         let target_rank = if config.n_scatter_retries == 0 {
@@ -163,6 +174,37 @@ pub fn exploration_phase(
         sep.prob.layouts.len(), best_cost, best.density(instance) * 100.0);
 
     feasible_sols
+}
+
+/// The density the solution would have to reach to fit into **one bin fewer**.
+///
+/// Computed as `Σ placed item area / Σ container area of the (n-1) largest containers`. Using the
+/// *largest* containers is the optimistic choice: it is the best case for the reduction, so a value
+/// above 1.0 proves the reduction impossible, and a value above a (configured) realistic packing
+/// density makes it hopeless in practice.
+///
+/// Returns `f32::INFINITY` when there is nothing to reduce (fewer than 2 layouts), which makes the
+/// caller skip the exploration.
+pub fn required_density_for_reduction(sep: &BPSeparator) -> f32 {
+    if sep.prob.layouts.len() < 2 {
+        return f32::INFINITY;
+    }
+    let total_item_area: f32 = sep.prob.layouts.values()
+        .map(|l| l.placed_item_area(&sep.instance))
+        .sum();
+
+    // The (n-1) largest containers: sort descending by area (ties by LayKey order → deterministic)
+    let remaining_area: f32 = sep.prob.layouts.iter()
+        .map(|(lkey, l)| (lkey, OrderedFloat(l.container.area())))
+        .sorted_by_key(|(lkey, area)| (Reverse(*area), *lkey))
+        .take(sep.prob.layouts.len() - 1)
+        .map(|(_, area)| area.0)
+        .sum();
+
+    match remaining_area > 0.0 {
+        true => total_item_area / remaining_area,
+        false => f32::INFINITY,
+    }
 }
 
 /// Disrupts the current (feasible) solution by swapping two 'large' items.

@@ -2,10 +2,20 @@
 //!
 //! Once the exploration phase can no longer eliminate a bin, the primary objective (bin count) is
 //! settled and the *secondary* objective takes over: make the leftover material as reusable as
-//! possible by pushing the content of the least dense bin into one corner, so that what remains is
-//! a single rectangular offcut instead of a scattered set of gaps.
+//! possible by concentrating it in a single bin, so that what remains is a single rectangular
+//! offcut instead of a scattered set of gaps spread over every bin.
 //!
-//! This is done by treating the least dense bin as a **strip packing** subproblem: its items are
+//! This happens in two steps:
+//!
+//! 1. **Pack-down** ([`pack_down`]) — the *cross-layout* step. Items are moved out of the least
+//!    dense bin into the other (denser) ones, one at a time, each accepted only when the global
+//!    separation loop can make room for it without any collision left anywhere. This is what
+//!    empties the sparsest bin; if it empties completely, jagua-rs auto-closes it and the bin count
+//!    drops as a bonus.
+//! 2. **Strip consolidation** ([`consolidate_layout`]) — the *intra-layout* step, on the (now much
+//!    sparser) least dense bin: push its remaining content against one edge.
+//!
+//! The second step is done by treating the least dense bin as a **strip packing** subproblem: its items are
 //! lifted into a fresh [`SPInstance`] whose strip has the bin's height and width, seeded with the
 //! current placements, and the existing SPP machinery ([`crate::optimizer::explore::exploration_phase`])
 //! is asked to shrink that strip. If it succeeds, the resulting (narrower) placements are written
@@ -16,29 +26,37 @@
 //! case this phase is a no-op that only *reports* the per-bin statistics.
 
 use crate::config::BPCompressionConfig;
+use crate::eval::sep_evaluator::SeparationEvaluator;
 use crate::optimizer::bpp::separator::BPSeparator;
+use crate::optimizer::bpp::worker::clamp_to_container;
 use crate::optimizer::explore::exploration_phase as sp_exploration_phase;
 use crate::optimizer::separator::Separator;
+use crate::sample::search::search_placement;
 use crate::util::bpp_io::BPSolutionListener;
 use crate::util::listener::{DummySolListener, ReportType};
 use crate::util::terminator::{BasicTerminator, Terminator};
 use itertools::Itertools;
 use jagua_rs::Instant;
-use jagua_rs::entities::Instance;
+use jagua_rs::entities::{Instance, PItemKey};
 use jagua_rs::geometry::DTransformation;
 use jagua_rs::geometry::primitives::Rect;
 use jagua_rs::probs::bpp::entities::{BPInstance, BPLayoutType, BPPlacement, BPSolution, LayKey};
 use jagua_rs::probs::spp::entities::{SPInstance, SPPlacement, SPProblem, Strip};
 use log::{debug, info, warn};
+use ordered_float::OrderedFloat;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{Rng, RngExt, SeedableRng};
+use std::cmp::Reverse;
+use std::time::Duration;
 
 /// BPP counterpart of [`crate::optimizer::compress::compression_phase`].
 ///
-/// Takes the best solution of the exploration phase, reports the per-bin statistics and — when
-/// `config.consolidate_remainder` is enabled — attempts to consolidate the content of the least
-/// dense bin towards the left edge of that bin. Returns the improved solution, or `init_sol`
-/// unchanged when no (verified feasible) improvement could be made.
+/// Takes the best solution of the exploration phase and alternates the two consolidation steps —
+/// [`pack_down`] (cross-layout, `config.pack_down`) and [`consolidate_layout`] (intra-layout,
+/// `config.consolidate_remainder`) — until the budget runs out or a full round changes nothing.
+///
+/// Returns the improved solution, or `init_sol` unchanged when no (verified feasible) improvement
+/// could be made.
 pub fn compression_phase(
     instance: &BPInstance,
     sep: &mut BPSeparator,
@@ -50,37 +68,284 @@ pub fn compression_phase(
     sep.rollback(init_sol, None);
     let mut best_sol = init_sol.clone();
 
-    let stats = report_stats(instance, sep, "start");
-
-    let Some((target, used_width, _)) = stats.first().copied() else {
+    if report_stats(instance, sep, "start").is_empty() {
         warn!("[BPCMPR] no layouts to compress");
         return best_sol;
-    };
-
-    if !config.consolidate_remainder {
-        info!("[BPCMPR] remainder consolidation disabled, returning the exploration solution unchanged");
-        return best_sol;
-    }
-    if term.kill() {
-        info!("[BPCMPR] no time left for remainder consolidation");
-        return best_sol;
     }
 
-    match consolidate_layout(sep, target, used_width, term, config) {
-        Some(new_sol) => {
-            best_sol = new_sol;
+    // The two steps alternate until the budget runs out or a full round changes nothing: the strip
+    // consolidation frees a contiguous block in the sparsest bin, which occasionally lets the next
+    // pack-down round move another item out of it (and vice versa).
+    let mut round = 0usize;
+    while !term.kill() {
+        round += 1;
+        let mut progress = false;
+
+        // --- 1. Pack-down: empty the least dense bin into the other ones ---------------------
+        // It gets a *share* of the remaining budget (`pack_down_time_ratio`); the rest is reserved
+        // for the strip consolidation that turns the emptied bin's remainder into a single offcut.
+        if config.pack_down && !term.kill() {
+            let pack_down_term = share_of(term, config.pack_down_time_ratio, config.time_limit);
+            let (new_sol, n_moved) = pack_down(sep, &pack_down_term, config, sol_listener, instance);
+            if n_moved > 0 {
+                best_sol = new_sol;
+                progress = true;
+            }
             sep.rollback(&best_sol, None);
-            report_stats(instance, sep, "after consolidation");
-            sol_listener.report(ReportType::CmprFeas, &best_sol, instance);
         }
-        None => {
-            // Any failed attempt leaves the separator in an undefined state: restore the input.
-            sep.rollback(init_sol, None);
-            info!("[BPCMPR] no improvement, keeping the exploration solution");
+
+        if !config.consolidate_remainder {
+            info!("[BPCMPR] remainder consolidation disabled");
+            break;
+        }
+        if term.kill() {
+            info!("[BPCMPR] no time left for remainder consolidation");
+            break;
+        }
+
+        // --- 2. Strip consolidation of the (now sparser) least dense bin ---------------------
+        // Recompute the statistics: the pack-down step may have changed which bin is the least
+        // dense one (and may have removed a bin entirely).
+        let stats = report_stats(instance, sep, &format!("round {round}, before consolidation"));
+        let Some((target, used_width, _)) = stats.first().copied() else {
+            warn!("[BPCMPR] no layouts left to consolidate");
+            break;
+        };
+        let pre_consolidation_sol = best_sol.clone();
+
+        match consolidate_layout(sep, target, used_width, term, config) {
+            Some(new_sol) => {
+                best_sol = new_sol;
+                sep.rollback(&best_sol, None);
+                report_stats(instance, sep, &format!("round {round}, after consolidation"));
+                sol_listener.report(ReportType::CmprFeas, &best_sol, instance);
+                progress = true;
+            }
+            None => {
+                // Any failed attempt leaves the separator in an undefined state: restore the last
+                // known-good solution (the pack-down result, or the exploration input if pack-down
+                // was a no-op).
+                best_sol = pre_consolidation_sol;
+                sep.rollback(&best_sol, None);
+                info!("[BPCMPR] no consolidation improvement, keeping the pre-consolidation solution");
+            }
+        }
+
+        if !progress {
+            info!("[BPCMPR] round {round} changed nothing, compression converged");
+            break;
         }
     }
 
     best_sol
+}
+
+/// **Pack-down**: repeatedly move items out of the least dense bin into the other (denser) ones.
+///
+/// This is the cross-layout counterpart of the (intra-layout) separation loop, and the step that
+/// actually makes the leftover material *one* large piece:
+///
+/// ```text
+/// loop while time remains:
+///   L = least dense open layout
+///   for every item of L, largest area first:
+///     for every other layout M, most free area first:
+///       snapshot; move the item L -> M at a random position; search its best position in M;
+///       separate() with a short budget (this is what "makes room" for the newcomer);
+///       total loss == 0 ?  accept  :  roll back and try the next M
+///   stop when a full pass over L moved nothing
+/// ```
+///
+/// Every accepted state is verified feasible (zero total loss over *all* layouts, `is_feasible()`
+/// per layout and the full demand still placed), so the returned solution is always feasible.
+/// If a bin empties out completely it auto-closes and the bin count — the primary objective —
+/// drops as a side effect.
+///
+/// Returns the best (feasible) solution found **and how many items were moved across bins**; the
+/// separator is left on that solution.
+pub fn pack_down(
+    sep: &mut BPSeparator,
+    term: &impl Terminator,
+    config: &BPCompressionConfig,
+    sol_listener: &mut impl BPSolutionListener,
+    instance: &BPInstance,
+) -> (BPSolution, usize) {
+    let mut best_sol = sep.prob.save();
+    debug_assert!(sep.total_loss() == 0.0, "pack_down must start from a feasible solution");
+
+    if sep.prob.layouts.len() < 2 {
+        info!("[BPCMPR] only one bin, nothing to pack down");
+        return (best_sol, 0);
+    }
+
+    // Short, cheap separations: a pack-down attempt is a *local* repair (one extra item in one
+    // bin) and hundreds of them are made.
+    let outer_config = sep.swap_config(config.pack_down_separator_config);
+
+    let mut n_moved = 0usize;
+    let start = Instant::now();
+
+    'outer: loop {
+        if term.kill() {
+            break;
+        }
+        let Some(src) = sep.least_dense_layout() else { break };
+        if sep.prob.layouts.len() < 2 {
+            break;
+        }
+
+        // Items of the source, largest original area first (ties by PItemKey order → deterministic).
+        let mut src_items = sep.prob.layouts[src].placed_items.keys().collect_vec();
+        src_items.sort_by_key(|pk| {
+            let item_id = sep.prob.layouts[src].placed_items[*pk].item_id;
+            (Reverse(OrderedFloat(sep.instance.item(item_id).area())), *pk)
+        });
+
+        let mut moved_this_pass = false;
+        for pk in src_items {
+            if term.kill() {
+                break 'outer;
+            }
+            // The source may have been closed by a successful move, or `pk` may be stale after an
+            // accepted move (accepted moves never touch the *other* items of the source, but a
+            // rollback restores keys, so guard anyway).
+            if !sep.prob.layouts.contains_key(src) {
+                break;
+            }
+            if !sep.prob.layouts[src].placed_items.contains_key(pk) {
+                continue;
+            }
+
+            // Destinations: every other open layout, most free area first.
+            let destinations = sep.prob.layouts.iter()
+                .filter(|(lkey, _)| *lkey != src)
+                .map(|(lkey, l)| (lkey, OrderedFloat(l.container.area() - l.placed_item_area(&sep.instance))))
+                .sorted_by_key(|(lkey, free)| (Reverse(*free), *lkey))
+                .map(|(lkey, _)| lkey)
+                .collect_vec();
+
+            for dst in destinations {
+                if term.kill() {
+                    break 'outer;
+                }
+                let snapshot = sep.save();
+                let item_id = sep.prob.layouts[src].placed_items[pk].item_id;
+
+                // 1. Move the item across at a random feasible position in `dst`.
+                let Some((new_pk, src_closed)) = sep.transfer_item(src, pk, dst) else {
+                    // The item does not fit in `dst` in any rotation; nothing was changed.
+                    continue;
+                };
+
+                // 2. Give it its *best* position in `dst` (lowest collision loss).
+                search_best_position(sep, dst, new_pk);
+
+                // 3. Let the global separation loop make room for the newcomer. It may move items
+                //    inside `dst` — and, since the loss is summed over all layouts, anywhere else.
+                let sub_term = short_term(term, config.pack_down_move_time_limit);
+                let (candidate, cts) = sep.separate(&sub_term);
+                let total_loss: f32 = cts.values().map(|ct| ct.get_total_loss()).sum();
+
+                if total_loss == 0.0 && {
+                    sep.rollback(&candidate, Some(&cts));
+                    solution_is_valid(sep)
+                } {
+                    let n_left = sep.prob.layouts.get(src).map_or(0, |l| l.placed_items.len());
+                    info!("[BPCMPR] moved item {item_id} from bin {src:?} to bin {dst:?}: {n_left} items left");
+                    if src_closed {
+                        info!("[BPCMPR] bin {src:?} is now empty and was closed: cost is now {}", sep.prob.bin_cost());
+                    }
+                    best_sol = candidate;
+                    n_moved += 1;
+                    moved_this_pass = true;
+                    sol_listener.report(ReportType::CmprFeas, &best_sol, instance);
+
+                    if src_closed {
+                        // The source is gone: restart from the (new) least dense bin.
+                        continue 'outer;
+                    }
+                    break;
+                }
+
+                // Failed: restore the state from before this attempt and try the next destination.
+                let (sol, cts) = snapshot;
+                sep.rollback(&sol, Some(&cts));
+                debug!("[BPCMPR] item {item_id} does not fit into bin {dst:?} (loss {}), rolling back",
+                    crate::FMT().fmt2(total_loss));
+            }
+        }
+
+        if !moved_this_pass {
+            debug!("[BPCMPR] a full pass over bin {src:?} moved nothing, pack-down converged");
+            break;
+        }
+    }
+
+    sep.swap_config(outer_config);
+    sep.rollback(&best_sol, None);
+    info!("[BPCMPR] pack-down finished: {n_moved} item(s) moved across bins in {:.1}s, {} bin(s), cost {}",
+        start.elapsed().as_secs_f32(), sep.prob.layouts.len(), sep.prob.bin_cost());
+
+    (best_sol, n_moved)
+}
+
+/// Searches for the lowest-loss position of `pk` inside layout `lkey` and moves it there.
+///
+/// Uses exactly the same machinery as the separation workers — a [`SeparationEvaluator`] over the
+/// destination layout and [`search_placement`] with the item's current placement as the reference —
+/// so a freshly transferred item is not left at the random position [`BPSeparator::transfer_item`]
+/// dropped it at. Returns the item's (possibly new) key.
+fn search_best_position(sep: &mut BPSeparator, lkey: LayKey, pk: PItemKey) -> PItemKey {
+    // The search borrows the layout and the tracker immutably while it needs an RNG mutably, so it
+    // gets its own RNG seeded from the master stream (which keeps the whole step deterministic).
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(sep.rng.next_u64());
+
+    let best_sample = {
+        let layout = &sep.prob.layouts[lkey];
+        let item = sep.instance.item(layout.placed_items[pk].item_id);
+        let evaluator = SeparationEvaluator::new(layout, item, pk, &sep.trackers[lkey]);
+        let (best_sample, _) = search_placement(
+            layout, item, Some(pk), evaluator, sep.config.sample_config, &mut rng,
+        );
+        // Keep the item inside the bin (see `worker::clamp_to_container`).
+        best_sample.map(|(dt, _)| clamp_to_container(dt, item, layout.container.outer_cd.bbox).0)
+    };
+
+    match best_sample {
+        Some(dt) => sep.move_item(lkey, pk, dt),
+        None => pk,
+    }
+}
+
+/// A private terminator granting `ratio` of `term`'s remaining budget (falling back to `ratio` of
+/// `fallback` when `term` has no deadline at all).
+fn share_of(term: &impl Terminator, ratio: f32, fallback: Duration) -> BasicTerminator {
+    let remaining = match term.timeout_at() {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+        None => fallback,
+    };
+    let mut t = BasicTerminator::new();
+    t.new_timeout(remaining.mul_f32(ratio.clamp(0.0, 1.0)));
+    t
+}
+
+/// A private terminator granting `min(remaining budget, limit)`.
+fn short_term(term: &impl Terminator, limit: Duration) -> BasicTerminator {
+    let budget = match term.timeout_at() {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(limit),
+        None => limit,
+    };
+    let mut t = BasicTerminator::new();
+    t.new_timeout(budget);
+    t
+}
+
+/// Full feasibility guard, matching the one the write-back uses: zero total loss, every layout
+/// verified by jagua-rs' own CDE, and the complete demand still placed.
+fn solution_is_valid(sep: &BPSeparator) -> bool {
+    sep.total_loss() == 0.0
+        && sep.prob.layouts.values().all(|l| l.is_feasible())
+        && sep.prob.item_demand_qtys.iter().all(|&d| d == 0)
 }
 
 /// Logs the per-bin density and used width and returns them, sorted by density (least dense first).

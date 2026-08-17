@@ -18,10 +18,13 @@ The optimizer pursues two objectives, strictly in this order:
 
 1. **Primary — bin cost.** Minimise `Σ cost(bin)` over all opened bins. With the default cost of `1`
    per bin this is simply "use as few sheets as possible". This is what the *exploration phase* does.
-2. **Secondary — remainder consolidation.** Once no further bin can be eliminated, push the content
-   of the **least dense** bin towards one edge, so that the material left over in that bin is a single
-   rectangular offcut instead of a scattered set of unusable gaps. This is what the *compression
-   phase* does. It never changes the bin count and never makes the solution infeasible.
+2. **Secondary — remainder consolidation.** Once no further bin can be eliminated, concentrate the
+   leftover material in **one** bin, so that what remains is a single rectangular offcut instead of a
+   scattered set of unusable gaps spread over every bin. This is what the *compression phase* does, in
+   two alternating steps: **pack-down** moves items *out of* the least dense bin into the others
+   (cross-layout), and **strip consolidation** pushes what is left in it against one edge
+   (intra-layout). Neither can make the solution infeasible; the bin count can only go *down* (a bin
+   that pack-down empties completely auto-closes).
 
 Both phases only ever accept solutions that are verified collision-free, so the returned solution is
 always feasible with the full demand placed.
@@ -121,7 +124,9 @@ cargo build --release --features only_final_svg
 -t, --global-time <SECONDS>      Global time limit (split 80% exploration / 20% compression)
 -e, --exploration <SECONDS>      Exploration phase time limit  (requires -c)
 -c, --compression <SECONDS>      Compression phase time limit  (requires -e)
--x, --early-termination          Stop after N consecutive failed bin-removal attempts
+-x, --early-termination          Stop after N consecutive failed bin-removal attempts, and make the
+                                 compression phase give up faster too (halved pack-down per-move
+                                 budget, halved pack-down iteration/strike limits)
 -s, --rng-seed <SEED>            Fixed seed for the random number generator
 -p, --parallel-runs <N>          Run N independent optimizations in parallel (seeds seed..seed+N-1)
                                  and keep the best (default: 1)
@@ -147,7 +152,9 @@ sparrow-bpp -i output/final_my_instance.json -t 300
 
 `-p N` uses otherwise idle cores: each run has its own worker threads (3 by default), so on an 8-core
 machine `-p 2`..`-p 4` gives several shots at the same time limit for a small per-run slowdown. The
-best run is the one with the **lowest bin cost**, ties broken by the **higher density**.
+best run is the one with the **lowest bin cost**, ties broken by the **lowest density of the least
+dense bin** — i.e. at equal bin count the run whose leftover is most concentrated in a single bin (the
+biggest usable offcut) wins, rather than the one that spreads the same slack evenly.
 
 ---
 
@@ -163,13 +170,17 @@ best run is the one with the **lowest bin cost**, ties broken by the **higher de
                     │    repeat:                                   │
                     │      close least-dense bin & scatter items   │
                     │      separate (GLS)   (bpp/separator.rs)     │
-                    │      feasible? → accept (one bin fewer)      │
-                    │      else      → roll back to best + disrupt │
+                    │      area bound? → stop, hand time to (3)    │
+                    │      feasible?   → accept (one bin fewer)    │
+                    │      else        → roll back to best+disrupt │
                     └──────────────────┬───────────────────────────┘
                                        │ minimal bin count
                     ┌──────────────────▼───────────────────────────┐
                     │ 3. Compression  (bpp/compress.rs)            │
-                    │    consolidate the least-dense bin's content │
+                    │    repeat while time remains:                │
+                    │      pack-down: move items out of the         │
+                    │        least-dense bin into the others       │
+                    │      consolidate the least-dense bin's rest  │
                     └──────────────────┬───────────────────────────┘
                                        ▼  final solution
 ```
@@ -185,7 +196,22 @@ closed again. If an item fits nowhere and no stock is left, this is a hard error
 
 ### 2. Exploration — bin-count reduction (`bpp/explore.rs`)
 
-The discrete counterpart of the SPP strip-shrink loop. Each attempt:
+The discrete counterpart of the SPP strip-shrink loop.
+
+**Area bound (checked before every attempt).** A reduction to `n - 1` bins can only exist if the placed
+item area fits into the `n - 1` *largest* remaining containers:
+
+```
+required_density = Σ placed item area / Σ container area of the (n-1) largest layouts
+```
+
+If `required_density > expl_cfg.max_reduction_density` (default **0.90**; set it to `1.0` for a pure
+area bound), the reduction is impossible — or hopelessly unlikely for irregular parts — and the phase
+logs `[BPEXPL] reduction to {n-1} bins needs {x}% density > cap, skipping exploration` and **returns
+immediately** instead of spinning until the timeout. The unused budget is handed to the compression
+phase (`optimize_bpp` logs the handover), where the pack-down step always has more work to do.
+
+Otherwise, each attempt:
 
 1. **Pick a target bin.** The *n*-th least dense open layout, where *n* cycles through
    `0..n_scatter_retries` as attempts fail. Varying the target makes retries genuinely different
@@ -215,16 +241,88 @@ failed (`-x`), or when a single bin is left.
 
 ### 3. Compression — remainder consolidation (`bpp/compress.rs`)
 
-The bin count is settled; now make the leftover material reusable. The **least dense** bin is lifted
-into a *strip packing subproblem*: its items become a fresh `SPInstance` whose strip has the bin's
-height and starts at the width its content currently occupies, seeded with the current placements.
-The existing SPP exploration phase is then asked to shrink that strip. If it succeeds, the narrower
-placements are translated back and written into the BPP layout.
+The bin count is settled; now make the leftover material reusable. Two steps alternate until the
+budget runs out or a full round changes nothing.
+
+#### 3a. Pack-down — cross-layout (`pack_down`)
+
+The step that actually makes the remainder *one* piece: it empties the least dense bin into the
+others, item by item.
+
+```
+loop while time remains:
+  L = least dense open layout                    (skip if only one layout)
+  for every item of L, largest original area first (ties by PItemKey → deterministic):
+    for every other layout M, most free area first (container.area - placed_item_area):
+      snapshot = sep.save()                      (solution + all tracker snapshots)
+      transfer the item L -> M at a random feasible-rotation position inside M's bbox
+      search its lowest-loss position in M       (SeparationEvaluator + search_placement, as in the workers)
+      separate() with a short budget             (the global "make room" step: it may move items
+                                                  inside M — and anywhere else, the loss is global)
+      total loss == 0 and feasible?  → accept, next item of L
+      else                           → rollback(snapshot), try the next M
+  stop when a full pass over L moved nothing
+```
+
+The cross-layout move itself is `BPSeparator::transfer_item`, the transactional primitive phase 1–3
+deferred. It embraces jagua-rs' auto-close semantics rather than fighting them: removing the *last*
+item of the source closes that layout and returns its bin to stock — which is exactly the outcome the
+step hopes for, since the bin count then drops as a side effect. The destination is always another
+open (non-empty) layout, so its `LayKey` survives the placement. Both touched layouts' trackers are
+rebuilt (only those two lose their GLS weights) and the workers are reseeded.
+
+Every accepted state passes the same guard the write-back uses: total loss `== 0` over **all**
+layouts, `Layout::is_feasible()` per layout, and the full demand still placed. Anything else is rolled
+back, so pack-down can never make the solution worse.
+
+The step uses its own, deliberately cheap separator (`pack_down_separator_config`: 50
+`iter_no_imprv_limit`, 2 strikes) because a pack-down attempt is a *local* repair and hundreds of them
+are made, and each attempt is capped at `pack_down_move_time_limit` (2 s). Pack-down as a whole may
+use `pack_down_time_ratio` (60 %) of the remaining compression budget; the rest is reserved for 3b.
+
+#### 3b. Strip consolidation — intra-layout (`consolidate_layout`)
+
+The **least dense** bin (recomputed: pack-down may have changed which one that is) is lifted into a
+*strip packing subproblem*: its items become a fresh `SPInstance` whose strip has the bin's height and
+starts at the width its content currently occupies, seeded with the current placements. The existing
+SPP exploration phase is then asked to shrink that strip. If it succeeds, the narrower placements are
+translated back and written into the BPP layout.
 
 The write-back is fully guarded: the rebuilt layout is verified with jagua-rs' own CDE
 (`Layout::is_feasible()` **and** total tracker loss `== 0`), and the item count and demand are checked.
-On any failure the phase rolls back to the exploration solution, so in the worst case compression is a
-no-op that only reports the per-bin statistics.
+On any failure the phase rolls back to the pre-consolidation solution, so in the worst case compression
+is a no-op that only reports the per-bin statistics.
+
+---
+
+## Configuration knobs
+
+All defaults live in `DEFAULT_BPP_CONFIG` (`src/config.rs`).
+
+### `BPExplorationConfig`
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `time_limit` | 9 min (CLI overrides) | Wall-clock budget for the exploration phase. Unused time goes to compression. |
+| `max_reduction_density` | `0.90` | **Area bound.** Skip (and return from) the exploration when reducing to `n-1` bins would need a higher density than this. `1.0` = pure area bound. |
+| `max_conseq_failed_attempts` | `None` (`-x` → 10) | Give up after this many consecutive failed reductions. |
+| `n_scatter_retries` | `3` | Consecutive failed attempts target the 1st, 2nd, … least dense bin. |
+| `separator_config` | 200 iters / 3 strikes | The GLS separation loop used for a reduction attempt. |
+| `solution_pool_distribution_stddev` | `0.25` | Half-normal spread when picking a pooled attempt (sets the disruption strength). |
+| `large_item_ch_area_cutoff_percentile` | `0.75` | Which items count as 'large' during disruption. |
+
+### `BPCompressionConfig`
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `time_limit` | 60 s (CLI overrides) | Budget for the whole compression phase, **plus** whatever exploration left unused. |
+| `pack_down` | `true` | Run the cross-layout pack-down step. |
+| `pack_down_time_ratio` | `0.6` | Share of the *remaining* compression budget pack-down may use per round; the rest is reserved for the strip consolidation. |
+| `pack_down_move_time_limit` | `2 s` | Budget for one pack-down attempt (one item into one destination bin). `-x` halves it. |
+| `pack_down_separator_config` | 50 iters / 2 strikes | Deliberately cheap separator for the "make room" step. `-x` halves both limits. |
+| `consolidate_remainder` | `true` | Run the strip consolidation of the least dense bin. |
+| `consolidation_expl_cfg` | 30 s, shrink 0.005 | The SPP sub-optimization used for it; its `time_limit` caps a *single* consolidation attempt. |
+| `separator_config` | 100 iters / 5 strikes | Separator the phase is constructed with (restored around each pack-down round). |
 
 ---
 
@@ -248,32 +346,50 @@ when comparing 1 / 3 / 8 / 16 workers on the same input.
 ## Measured results
 
 Measured on a 112-part instance (a strip packing instance of `strip_height` 1000, run through `--bin`)
-and on `swim.json`:
+and on `swim.json`, all with `-e 30 -c 20 -s 42` unless noted. "**offcut**" is `bin width − used width`
+of the least dense bin: the width of the contiguous rectangular remainder.
 
-| Input | Bins | Density | Note |
-| --- | --- | --- | --- |
-| 112 parts, `--bin 2000x1000 -e 30 -c 20 -s 42` | **4** | 70.7 % | 3 bins would need 94 % — infeasible |
-| 112 parts, `--bin 3000x1500 -e 30 -c 20 -s 42` | **2** | 62.9 % | consolidation narrowed the last bin's used width **2124 → 1865** of 3000 |
-| `swim.json`, `--bin 3200x3200` | **4** | — | 3 bins would need 82.8 % |
+| Input | Bins | Least dense bin | Used width of that bin | Offcut |
+| --- | --- | --- | --- | --- |
+| 112 parts, `--bin 2000x1000` — *before* pack-down | 4 | 65.9 % | 1985 / 2000 | 15 |
+| 112 parts, `--bin 2000x1000` — **with pack-down** | 4 | **41.9 %** | **1308** / 2000 | **692** |
+| 112 parts, `--bin 3000x1500` — *before* pack-down | 2 | 54.6 % | 2124 / 3000 | 876 |
+| 112 parts, `--bin 3000x1500` — **with pack-down** | 2 | **45.1 %** | **1534** / 3000 | **1466** |
+| `swim.json`, `--bin 3200x3200`, `-e 10 -c 25 -s 0` — after exploration | 4 | 48.8 % | — | — |
+| `swim.json`, `--bin 3200x3200`, `-e 10 -c 25 -s 0` — **with pack-down** | 4 | **29.9 %** | — | — |
 
-The consolidation result on the second row is the point of the compression phase: the same two bins
-hold the same parts, but the leftover material in the last bin became a contiguous 1135-wide offcut
-instead of 876 wide plus scattered gaps.
+The bin count is unchanged in all three cases — it is already area-optimal (3 bins of 2000x1000 would
+need 94.3 % density, one bin of 3000x1500 would need 125.7 %) — and that is the point: the *total*
+density cannot improve either, so the only thing left to optimise is **where** the slack sits. Pack-down
+moves it out of three bins into one, turning the 112-part result from "four bins each with a sliver of
+waste" into "three nearly full bins plus a 692 x 1000 clean offcut".
 
----
+Both instances also demonstrate the area bound: exploration now returns in **< 0.1 s** instead of
+burning its full 30 s on provably impossible 4 → 3 (resp. 2 → 1) attempts, and `optimize_bpp` hands
+that time to the compression phase (`[BPOPT] exploration returned 30.0s before its deadline, handing
+that time to compression (20.0s -> 50.0s)`).
 
 ## Known limitations
 
 These are deliberate v1 scope decisions, not bugs:
 
-* **Intra-layout moves only.** During separation an item is always re-placed in the bin it currently
-  sits in. Items migrate between bins only via `close_bin_and_scatter` and disruption, never as part of
-  the GLS loop.
+* **Intra-layout moves only *during separation*.** Inside the GLS separation loop an item is always
+  re-placed in the bin it currently sits in. Items migrate between bins via `close_bin_and_scatter`
+  (exploration) and `transfer_item` (the compression phase's pack-down step), never as part of a GLS
+  move itself.
 * **One bin type per opened layout, chosen greedily.** The bin type is picked by lowest `cost / area`
   among those with stock, at the moment the bin is opened. There is no search over the *mix* of bin
   types, so heterogeneous-bin instances are handled greedily rather than optimally.
-* **Consolidation targets only the least dense bin.** The compression phase consolidates one bin — the
-  least dense one, where the largest offcut is. Other bins are only reported on.
+* **Consolidation targets only the least dense bin.** Both compression steps work on one bin — the
+  least dense one, where the largest offcut is. Other bins are only reported on (and receive the items
+  pack-down evicts).
+* **Pack-down is greedy and first-fit.** Items leave the sparsest bin largest-first and enter the first
+  destination that accepts them; there is no look-ahead over *which* item should go *where*, and no
+  backtracking over an accepted move. A move is also never undone once accepted, even if a later one
+  would have been better.
+* **The area bound is a heuristic cap, not a proof.** With the default `max_reduction_density = 0.90`
+  the exploration also skips reductions that are merely *unlikely* (needing 90–100 % density). Set it
+  to `1.0` for a pure "provably impossible" bound at the cost of spending the budget on long shots.
 * **Consolidation only pushes along one axis.** The bin is lifted into a strip of the bin's *height*,
   so the content is compacted horizontally; the offcut is a full-height vertical strip on the right.
 * **Coordinate-descent clamp.** The coordinate descent inside `search_placement` is unbounded, and in a
@@ -292,13 +408,13 @@ These are deliberate v1 scope decisions, not bugs:
 
 ## How to extend
 
-**Cross-layout moves.** The hook is `BPSeparatorWorker::move_items` in `src/optimizer/bpp/worker.rs`:
-the destination layout is currently fixed to the item's own (`lkey`), and would be chosen just before
-the `SeparationEvaluator` is constructed. `BPSeparatorWorker::move_item` would gain a destination
-parameter. The care needed is on the bookkeeping side: `BPProblem::remove_item` auto-closes a layout
-when its last item goes, which invalidates the `LayKey` and returns the bin to stock, so a
-remove-then-place across layouts must be transactional (both trackers updated, bin count restored on
-rollback).
+**Cross-layout moves inside the GLS loop.** The transactional primitive now exists —
+`BPSeparator::transfer_item` — so this is no longer the blocker it was in v1. The remaining hook is
+`BPSeparatorWorker::move_items` in `src/optimizer/bpp/worker.rs`, where the destination layout is still
+fixed to the item's own (`lkey`) and would be chosen just before the `SeparationEvaluator` is
+constructed. The care needed there is different from the pack-down case: a *worker* holds a private
+copy of the problem and merges by key, so an auto-close inside a worker changes the master's key space
+and forces a full tracker rebuild on merge.
 
 **Iteration-based terminator.** `Terminator` (`src/util/terminator.rs`) is a trait; implementing an
 iteration-counting variant next to `BasicTerminator` would make runs bit-for-bit reproducible for a
@@ -317,10 +433,10 @@ optimising for a target offcut size, plugs in there.
 | --- | --- |
 | `src/optimizer/bpp/mod.rs` | `optimize_bpp()` — orchestration (LBF → explore → compress) |
 | `src/optimizer/bpp/lbf.rs` | `BPLBFBuilder` — constructive first solution |
-| `src/optimizer/bpp/separator.rs` | `BPSeparator` — separation loop, per-layout trackers, `close_bin_and_scatter` |
+| `src/optimizer/bpp/separator.rs` | `BPSeparator` — separation loop, per-layout trackers, `close_bin_and_scatter`, `transfer_item` |
 | `src/optimizer/bpp/worker.rs` | `BPSeparatorWorker` — parallel move workers, `clamp_to_container` |
-| `src/optimizer/bpp/explore.rs` | Bin-count reduction loop + disruption |
-| `src/optimizer/bpp/compress.rs` | Remainder consolidation |
+| `src/optimizer/bpp/explore.rs` | Bin-count reduction loop, area bound (`required_density_for_reduction`) + disruption |
+| `src/optimizer/bpp/compress.rs` | `pack_down` (cross-layout) + strip consolidation of the remainder |
 | `src/util/bpp_io.rs` | CLI parsing, input formats, warm-start import, JSON/SVG export |
 | `src/bpp_main.rs` | The `sparrow-bpp` binary |
 | `src/config.rs` | `BPConfig`, `BPExplorationConfig`, `BPCompressionConfig`, `DEFAULT_BPP_CONFIG` |

@@ -7,7 +7,7 @@
 //! The only structural differences with the SPP binary are the input handling (a strip packing
 //! instance can be turned into a bin packing one with `--bin WxH[:stock[:cost]]`) and the
 //! comparison of parallel runs: the best run is the one with the lowest bin **cost**, ties broken
-//! by the higher density.
+//! by the **lowest density of the least dense bin** (= the largest consolidated remainder).
 
 use anyhow::{bail, Context, Result};
 use clap::Parser as Clap;
@@ -64,6 +64,13 @@ fn main() -> Result<()> {
     config.cmpr_cfg.time_limit = compress_dur;
     if args.early_termination {
         config.expl_cfg.max_conseq_failed_attempts = Some(DEFAULT_MAX_CONSEQ_FAILS_EXPL);
+        // Also make the compression phase give up faster: halve the per-move budget of the
+        // pack-down step and cut its separator's iteration/strike limits.
+        config.cmpr_cfg.pack_down_move_time_limit /= 2;
+        config.cmpr_cfg.pack_down_separator_config.iter_no_imprv_limit =
+            (config.cmpr_cfg.pack_down_separator_config.iter_no_imprv_limit / 2).max(1);
+        config.cmpr_cfg.pack_down_separator_config.strike_limit =
+            (config.cmpr_cfg.pack_down_separator_config.strike_limit / 2).max(1);
         warn!("[MAIN] early termination enabled!");
     }
     if let Some(arg_rng_seed) = args.rng_seed {
@@ -188,11 +195,15 @@ fn main() -> Result<()> {
         for (run_idx, sol) in solutions.iter() {
             info!("[MAIN] run {} (seed {}): {}", run_idx, seed + *run_idx as u64, bpp_io::summarize(sol, &instance));
         }
-        // Best = lowest cost, ties broken by the higher density. `min_by` returns the first minimum.
+        // Best = lowest cost, ties broken by the **lowest density of the least dense bin**: at equal
+        // bin count the useful result is the one whose leftover material is concentrated in a single
+        // bin (= the biggest consolidated remainder), not the one that spreads the same slack evenly.
+        // `min_by` returns the first minimum.
         let (best_idx, best_sol) = solutions.into_iter()
             .min_by(|(_, a), (_, b)| {
                 a.cost(&instance).cmp(&b.cost(&instance))
-                    .then_with(|| b.density(&instance).partial_cmp(&a.density(&instance)).unwrap_or(Ordering::Equal))
+                    .then_with(|| min_bin_density(a, &instance)
+                        .partial_cmp(&min_bin_density(b, &instance)).unwrap_or(Ordering::Equal))
             })
             .expect("at least one run");
         info!("[MAIN] best run: {} (seed {}), {}", best_idx, seed + best_idx as u64, bpp_io::summarize(&best_sol, &instance));
@@ -213,4 +224,14 @@ fn main() -> Result<()> {
     bpp_io::write_bp_json(&json_output, Path::new(json_path.as_str()))?;
 
     Ok(())
+}
+
+/// The density of the **least dense** bin of a solution (`f32::INFINITY` for an empty solution).
+///
+/// Used as the tie-break between parallel runs of equal bin cost: the lower this value, the more of
+/// the leftover material is concentrated in one bin, i.e. the larger the usable offcut.
+fn min_bin_density(sol: &BPSolution, instance: &jagua_rs::probs::bpp::entities::BPInstance) -> f32 {
+    sol.layout_snapshots.values()
+        .map(|ls| ls.density(instance))
+        .fold(f32::INFINITY, f32::min)
 }

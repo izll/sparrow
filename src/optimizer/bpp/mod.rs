@@ -37,6 +37,7 @@ use crate::optimizer::bpp::explore::exploration_phase;
 use crate::util::bpp_io::BPSolutionListener;
 use crate::util::listener::ReportType;
 use crate::util::terminator::Terminator;
+use jagua_rs::Instant;
 use jagua_rs::probs::bpp::entities::{BPInstance, BPProblem, BPSolution};
 use log::info;
 use rand::rngs::Xoshiro256PlusPlus;
@@ -108,7 +109,18 @@ pub fn optimize_bpp(
         final_explore_sol.cost(&instance), final_explore_sol.density(&instance) * 100.0);
 
     // --- 3. Compression: consolidate the remainder -------------------------------------------
-    terminator.new_timeout(config.cmpr_cfg.time_limit);
+    // The exploration phase can return long before its deadline (e.g. the area bound proves that no
+    // further bin can be eliminated). Hand that unused time to the compression phase rather than
+    // dropping it: the pack-down / consolidation steps always have more work to do.
+    let remaining_expl_time = terminator.timeout_at()
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_default();
+    let cmpr_time = config.cmpr_cfg.time_limit + remaining_expl_time;
+    if !remaining_expl_time.is_zero() {
+        info!("[BPOPT] exploration returned {:.1}s before its deadline, handing that time to compression ({:.1}s -> {:.1}s)",
+            remaining_expl_time.as_secs_f32(), config.cmpr_cfg.time_limit.as_secs_f32(), cmpr_time.as_secs_f32());
+    }
+    terminator.new_timeout(cmpr_time);
     let mut cmpr_separator = BPSeparator::new(
         expl_separator.instance,
         expl_separator.prob,
