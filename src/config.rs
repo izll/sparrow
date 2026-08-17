@@ -101,3 +101,95 @@ pub const DEFAULT_SPARROW_CONFIG: SparrowConfig = SparrowConfig {
     narrow_concavity_cutoff_ratio: Some((0.01, 0.01)),
     min_item_separation: None,
 };
+// ---------------------------------------------------------------------------------------------
+// Bin Packing Problem (BPP) configuration
+// ---------------------------------------------------------------------------------------------
+
+/// Top-level configuration of the BPP pipeline ([`crate::optimizer::bpp::optimize_bpp`]).
+///
+/// Mirrors [`SparrowConfig`]: the geometry-related settings (`cde_config`, the shape-modification
+/// tolerances) are identical, only the phase configurations differ because the BPP explores a
+/// discrete objective (the number/cost of bins) instead of a continuous one (the strip width).
+#[derive(Debug, Clone, Copy)]
+pub struct BPConfig {
+    pub rng_seed: Option<usize>,
+    pub expl_cfg: BPExplorationConfig,
+    pub cmpr_cfg: BPCompressionConfig,
+    /// Configuration for the collision detection engine. See [`CDEConfig`].
+    pub cde_config: CDEConfig,
+    /// Polygon simplification tolerance: maximum allowable inflation of items when simplifying
+    /// their shape. Disabled if `None`.
+    pub poly_simpl_tolerance: Option<f32>,
+    /// Minimum distance between items and other hazards. Disabled if `None`.
+    pub min_item_separation: Option<f32>,
+    /// Maximum distance and area of a concavity to be considered "narrow" (which will be closed).
+    /// Disabled if `None`.
+    pub narrow_concavity_cutoff_ratio: Option<(f32, f32)>,
+}
+
+/// Configuration of the BPP exploration phase ([`crate::optimizer::bpp::explore::exploration_phase`]).
+#[derive(Debug, Clone, Copy)]
+pub struct BPExplorationConfig {
+    /// Wall-clock budget for the exploration phase.
+    pub time_limit: Duration,
+    /// Stop after this many consecutive failed bin-removal attempts. Unlimited if `None`.
+    pub max_conseq_failed_attempts: Option<usize>,
+    /// Reuses the SPP [`SeparatorConfig`] as-is.
+    pub separator_config: SeparatorConfig,
+    /// Standard deviation of the half-normal distribution used to pick a solution from the pool of
+    /// infeasible solutions (0 = always the best one, larger = more diverse).
+    pub solution_pool_distribution_stddev: f32,
+    /// Which items count as 'large' during disruption: the top percentile of the cumulative convex
+    /// hull area of all items.
+    pub large_item_ch_area_cutoff_percentile: f32,
+    /// How many different scatter targets are tried before falling back to the least dense bin
+    /// again. Consecutive attempts use the 1st, 2nd, ... least dense open layout as the bin to close.
+    pub n_scatter_retries: usize,
+}
+
+/// Configuration of the BPP compression phase ([`crate::optimizer::bpp::compress::compression_phase`]).
+#[derive(Debug, Clone, Copy)]
+pub struct BPCompressionConfig {
+    /// Wall-clock budget for the compression phase.
+    pub time_limit: Duration,
+    /// Reuses the SPP [`SeparatorConfig`] as-is.
+    pub separator_config: SeparatorConfig,
+    /// Whether to attempt the (strip-packing based) consolidation of the least dense bin.
+    /// If `false`, the compression phase only reports the per-bin statistics.
+    pub consolidate_remainder: bool,
+    /// Configuration of the *strip packing* sub-optimization used for the consolidation.
+    /// Its `time_limit` acts as the budget for a single consolidation attempt.
+    pub consolidation_expl_cfg: ExplorationConfig,
+}
+
+/// The BPP counterpart of [`DEFAULT_SPARROW_CONFIG`]: identical separator, sampling and geometry
+/// settings, only the phase-specific knobs differ.
+pub const DEFAULT_BPP_CONFIG: BPConfig = BPConfig {
+    rng_seed: None,
+    expl_cfg: BPExplorationConfig {
+        time_limit: Duration::from_secs(9 * 60),
+        max_conseq_failed_attempts: None,
+        separator_config: DEFAULT_SPARROW_CONFIG.expl_cfg.separator_config,
+        solution_pool_distribution_stddev: 0.25,
+        large_item_ch_area_cutoff_percentile: 0.75,
+        n_scatter_retries: 3,
+    },
+    cmpr_cfg: BPCompressionConfig {
+        time_limit: Duration::from_secs(60),
+        separator_config: DEFAULT_SPARROW_CONFIG.cmpr_cfg.separator_config,
+        consolidate_remainder: true,
+        consolidation_expl_cfg: ExplorationConfig {
+            shrink_step: 0.005,
+            // Budget for a *single* consolidation attempt; the phase's own `time_limit` caps the total.
+            time_limit: Duration::from_secs(30),
+            max_conseq_failed_attempts: Some(crate::consts::DEFAULT_MAX_CONSEQ_FAILS_EXPL),
+            solution_pool_distribution_stddev: 0.25,
+            separator_config: DEFAULT_SPARROW_CONFIG.cmpr_cfg.separator_config,
+            large_item_ch_area_cutoff_percentile: 0.75,
+        },
+    },
+    cde_config: DEFAULT_SPARROW_CONFIG.cde_config,
+    poly_simpl_tolerance: DEFAULT_SPARROW_CONFIG.poly_simpl_tolerance,
+    min_item_separation: DEFAULT_SPARROW_CONFIG.min_item_separation,
+    narrow_concavity_cutoff_ratio: DEFAULT_SPARROW_CONFIG.narrow_concavity_cutoff_ratio,
+};

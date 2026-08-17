@@ -13,6 +13,9 @@ use log::debug;
 use rand::prelude::SliceRandom;
 use rand::rngs::Xoshiro256PlusPlus;
 use slotmap::SecondaryMap;
+use jagua_rs::geometry::geo_traits::TransformableFrom;
+use jagua_rs::geometry::primitives::Rect;
+use jagua_rs::geometry::Transformation;
 use tap::Tap;
 
 /// BPP counterpart of [`crate::optimizer::worker::SeparatorWorker`].
@@ -118,8 +121,16 @@ impl BPSeparatorWorker {
 
                 let (new_dt, _eval) = best_sample.expect("search_placement should always return a sample");
 
+                // Keep the item inside the bin. The coordinate descent inside `search_placement` is
+                // unbounded, and in a large, sparsely filled bin it can walk an item far outside the
+                // container: the quadtree cannot index such a placement, which makes the specialized
+                // collision pipeline miss collisions against it (and trips its debug assertion).
+                // In the SPP the strip is always fitted tightly around the items, so this cannot
+                // happen there — hence the clamp lives here and SPP semantics stay untouched.
+                let (new_dt, clamped) = clamp_to_container(new_dt, item, layout.container.outer_cd.bbox);
+
                 // Move the item to the new position
-                self.move_item(lkey, pk, new_dt);
+                self.move_item(lkey, pk, new_dt, clamped);
                 total_moves += 1;
                 total_evals += n_evals;
             }
@@ -131,7 +142,11 @@ impl BPSeparatorWorker {
     ///
     /// Since the item is re-placed in a non-empty layout ([`BPLayoutType::Open`]), the layout is
     /// guaranteed to stay open across the remove/place pair, so the layout key stays valid.
-    pub fn move_item(&mut self, lkey: LayKey, pk: PItemKey, d_transf: DTransformation) -> PItemKey {
+    ///
+    /// `clamped` indicates that `d_transf` is *not* the transformation the evaluator scored, but a
+    /// clamped version of it (see [`clamp_to_container`]). In that case the "weighted loss never
+    /// increases" invariant does not hold and the corresponding debug assertion is skipped.
+    pub fn move_item(&mut self, lkey: LayKey, pk: PItemKey, d_transf: DTransformation, clamped: bool) -> PItemKey {
         debug_assert!(tracker_matches_layout(&self.trackers[lkey], &self.prob.layouts[lkey]));
 
         let item_id = self.prob.layouts[lkey].placed_items[pk].item_id;
@@ -171,9 +186,35 @@ impl BPSeparatorWorker {
         let (new_l, new_w_l) = (ct.get_loss(new_pk), ct.get_weighted_loss(new_pk));
 
         debug!("Moved {:?} (l: {}, wl: {}) to {:?} (l+1: {}, wl+1: {})", old_placement, FMT().fmt2(old_l), FMT().fmt2(old_w_l), new_placement, FMT().fmt2(new_l), FMT().fmt2(new_w_l));
-        debug_assert!(new_lkey != lkey || new_w_l <= old_w_l * 1.001, "weighted loss should never increase: {} > {}", FMT().fmt2(old_w_l), FMT().fmt2(new_w_l));
+        debug_assert!(clamped || new_lkey != lkey || new_w_l <= old_w_l * 1.001, "weighted loss should never increase: {} > {}", FMT().fmt2(old_w_l), FMT().fmt2(new_w_l));
         debug_assert!(tracker_matches_layout(&self.trackers[new_lkey], &self.prob.layouts[new_lkey]));
 
         new_pk
     }
+}
+
+/// Clamps a placement so that the item's (rotated) bounding box stays inside `container_bbox`.
+///
+/// Only the translation is adjusted; the rotation is left untouched (it is always one of the item's
+/// allowed rotations). If the item is wider or taller than the container in this rotation, the
+/// translation is left as-is: there is nothing sensible to clamp to, and the resulting `Exterior`
+/// collision is quantified normally.
+///
+/// Returns the (possibly adjusted) transformation and whether an adjustment was actually made.
+pub fn clamp_to_container(dt: DTransformation, item: &jagua_rs::entities::Item, container_bbox: Rect) -> (DTransformation, bool) {
+    // bbox of the item rotated by `dt.rotation()`, still centred on the item's own origin
+    let mut shape_buffer = item.shape_cd.as_ref().clone();
+    let r_bbox = shape_buffer
+        .transform_from(item.shape_cd.as_ref(), &Transformation::from_rotation(dt.rotation()))
+        .bbox;
+
+    // Valid translation range: the rotated bbox, shifted by the translation, must stay inside.
+    let (x_min, x_max) = (container_bbox.x_min - r_bbox.x_min, container_bbox.x_max - r_bbox.x_max);
+    let (y_min, y_max) = (container_bbox.y_min - r_bbox.y_min, container_bbox.y_max - r_bbox.y_max);
+
+    let (tx, ty) = dt.translation();
+    let c_tx = if x_min <= x_max { tx.clamp(x_min, x_max) } else { tx };
+    let c_ty = if y_min <= y_max { ty.clamp(y_min, y_max) } else { ty };
+
+    (DTransformation::new(dt.rotation(), (c_tx, c_ty)), c_tx != tx || c_ty != ty)
 }

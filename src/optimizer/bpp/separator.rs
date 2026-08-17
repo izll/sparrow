@@ -410,9 +410,21 @@ impl BPSeparator {
 
     /// The open layout with the lowest density (ties broken by LayKey order → deterministic).
     pub fn least_dense_layout(&self) -> Option<LayKey> {
+        self.nth_least_dense_layout(0)
+    }
+
+    /// The `n`-th least dense open layout (0 = least dense), or `None` if there are fewer layouts.
+    ///
+    /// Used by the exploration phase to vary the bin it tries to eliminate across consecutive
+    /// attempts: always attacking the same (least dense) bin makes retries very similar to each
+    /// other, whereas the second/third least dense bin gives a genuinely different subproblem.
+    /// Ties are broken by `LayKey` order, so the ordering is deterministic.
+    pub fn nth_least_dense_layout(&self, n: usize) -> Option<LayKey> {
         self.prob.layouts.iter()
-            .min_by_key(|(_, l)| OrderedFloat(l.density(&self.instance)))
+            .map(|(lkey, l)| (lkey, OrderedFloat(l.density(&self.instance))))
+            .sorted_by_key(|(_, dens)| *dens)
             .map(|(lkey, _)| lkey)
+            .nth(n)
     }
 }
 
