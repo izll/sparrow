@@ -238,8 +238,10 @@ pub fn bp_instance_from_sp(sp_instance: &ExtSPInstance, bins: &[BinSpec]) -> Ext
 /// ([`BPLayoutType::Closed`] with `bin_id = container_id`) and all remaining items go into that
 /// same layout ([`BPLayoutType::Open`]).
 ///
-/// Fails (`Err`) if the solution references an unknown bin/item id, or if a bin's stock is
-/// exhausted (`place_item(Closed{..})` itself does not check stock).
+/// Fails (`Err`) if the solution references an unknown bin/item id, if a bin's stock is exhausted
+/// (`place_item(Closed{..})` itself does not check stock), or if it places more copies of an item
+/// than the instance demands (`BPProblem::register_included_item` decrements an unchecked `usize`
+/// and would panic with an arithmetic overflow instead of reporting the malformed input).
 pub fn import_bp_solution(instance: &BPInstance, ext: &ExtBPSolution) -> Result<BPSolution> {
     let mut prob = BPProblem::new(instance.clone());
 
@@ -261,6 +263,13 @@ pub fn import_bp_solution(instance: &BPInstance, ext: &ExtBPSolution) -> Result<
             let item_id = ext_placement.item_id as usize;
             if item_id >= instance.items.len() {
                 bail!("layout {idx} references unknown item id {item_id}");
+            }
+            // `place_item` -> `register_included_item` decrements `item_demand_qtys[item_id]`
+            // without checking, so an over-placed item would panic (usize underflow) instead of
+            // producing a readable error. Check the remaining demand up front.
+            if prob.item_demand_qtys[item_id] == 0 {
+                bail!("layout {idx} places more copies of item {item_id} than the instance demands ({})",
+                    instance.item_qty(item_id));
             }
             let d_transf = {
                 let ext_transf = DTransformation::from(ext_placement.transformation.clone());

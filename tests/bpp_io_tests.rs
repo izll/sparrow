@@ -151,6 +151,41 @@ mod bpp_io_tests {
         Ok(())
     }
 
+    /// A malformed warm start (an item placed more often than the instance demands) must be
+    /// reported as an `Err`, not panic. `BPProblem::register_included_item` decrements an unchecked
+    /// `usize` demand counter, so without the guard in `import_bp_solution` this overflows.
+    #[test]
+    fn over_placed_item_is_rejected() -> Result<()> {
+        let instance = build_bp_instance()?;
+        let rng = Xoshiro256PlusPlus::seed_from_u64(SEED);
+        let solution = BPLBFBuilder::new(instance.clone(), rng, LBF_SAMPLE_CONFIG).construct()?.prob.save();
+        let mut ext_solution = bpp_io::export_bp(&instance, &solution);
+
+        // Duplicate every placement of the first layout: the demand of those items is now exceeded.
+        let first = ext_solution.layouts.first_mut().expect("the LBF solution has at least one layout");
+        let duplicates = first.placed_items.clone();
+        first.placed_items.extend(duplicates);
+
+        let res = bpp_io::import_bp_solution(&instance, &ext_solution);
+        assert!(res.is_err(), "an over-placed item must be rejected, not panic");
+        Ok(())
+    }
+
+    /// A warm start referencing a bin id the instance does not have must be an `Err`.
+    #[test]
+    fn unknown_bin_id_is_rejected() -> Result<()> {
+        let instance = build_bp_instance()?;
+        let rng = Xoshiro256PlusPlus::seed_from_u64(SEED);
+        let solution = BPLBFBuilder::new(instance.clone(), rng, LBF_SAMPLE_CONFIG).construct()?.prob.save();
+        let mut ext_solution = bpp_io::export_bp(&instance, &solution);
+
+        ext_solution.layouts.first_mut().expect("at least one layout").container_id = 99;
+
+        let res = bpp_io::import_bp_solution(&instance, &ext_solution);
+        assert!(res.is_err(), "an unknown bin id must be rejected");
+        Ok(())
+    }
+
     /// An `ExtBPOutput` file (instance + solution) must be re-readable as a warm start.
     #[test]
     fn ext_bp_output_round_trip_through_file() -> Result<()> {

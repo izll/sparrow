@@ -153,3 +153,84 @@ back into that layout (offset by the container bbox origin) — only if the resu
    `optimize_bpp()` orchestration.
 3. **Integration** — tests, docs (`docs/bpp.md`, README section), clippy clean, measurement on swim/shirts with
    `--bin`, and on the MADisoCAD 112-part case if an input file is available.
+
+---
+
+## Status (2026-08-17)
+
+Phases 1–3 are complete. `cargo test` is green (15 tests: 3 SPP integration + 12 BPP), `cargo clippy
+--all-targets` is clean for all BPP files, and `cargo build --release` (also with `--features
+only_final_svg`) succeeds.
+
+### Implemented as specified
+
+| Item | Where |
+| --- | --- |
+| `BPSeparator` + per-layout `CollisionTracker`s, `BPSnapshot` | `src/optimizer/bpp/separator.rs` |
+| `BPSeparatorWorker`, intra-layout `move_items` (SPP Alg. 5) | `src/optimizer/bpp/worker.rs` |
+| `BPLBFBuilder` — SPP item order, cheapest `cost/area` bin, `bail!` on no stock | `src/optimizer/bpp/lbf.rs` |
+| `separate()` — SPP Alg. 9 over the summed loss, `move_items_multi` (SPP Alg. 10) | `src/optimizer/bpp/separator.rs` |
+| `close_bin_and_scatter` — remove all, re-insert largest-first round-robin from the least dense | `src/optimizer/bpp/separator.rs` |
+| `exploration_phase` — bin-count reduction, pool, `max_conseq_failed_attempts` | `src/optimizer/bpp/explore.rs` |
+| `disrupt_solution` — SPP port, per layout, incl. `practically_contained_items` | `src/optimizer/bpp/explore.rs` |
+| `compression_phase` — the **stretch goal** (SPP sub-optimization + guarded write-back), not the v1 no-op | `src/optimizer/bpp/compress.rs` |
+| `--bin WxH[:stock[:cost]]`, 3 input formats, `import_bp_solution`, `BPSvgExporter` | `src/util/bpp_io.rs` |
+| `sparrow-bpp` binary incl. `-p` parallel runs | `src/bpp_main.rs` |
+| `BPConfig` / `BPExplorationConfig` / `BPCompressionConfig` / `DEFAULT_BPP_CONFIG` | `src/config.rs` |
+| User docs | `docs/bpp.md`, README section |
+
+All six non-negotiables hold: SPP files are semantically untouched, the container-agnostic core is
+called rather than forked, `jagua_rs::Instant` is used throughout, worker merging is index-ordered with
+RNGs derived from the master, no `HashMap` iteration, and `debug_assert!`s mirror the SPP ones.
+
+### Deviations from the spec
+
+* **Rollback target on failure.** The spec suggested rolling back to a *pooled infeasible* solution and
+  disrupting it (as SPP does). BPP instead always rolls back to the **best feasible** solution. Pooled
+  solutions have one bin fewer and are infeasible, so restarting from them compounds the infeasibility
+  rather than exploring. The pool is still used, but only to decide *how strongly* to disrupt: the
+  half-normal sample picks a pooled attempt and its rank becomes the number of swaps applied.
+* **`import_bp_solution` returns `Result`.** The spec did not specify error handling. It validates bin
+  ids, item ids, bin stock and remaining item demand, because `BPProblem::place_item` checks none of
+  these and `register_included_item` decrements an unchecked `usize` (an over-placed item panicked with
+  an arithmetic overflow instead of reporting the malformed file).
+* **Warm start validation in the CLI.** `optimize_bpp` panics by contract if no initial solution can be
+  built, so `bpp_main.rs` validates up front: it probes the LBF builder for a clean CLI error, and
+  rejects a warm start that does not cover the full demand or contains a colliding layout
+  (`BPProblem::restore` trusts the snapshot and cannot invent missing placements).
+* **Live SVG output is a *directory*, not a path.** `BPSvgExporter` takes `live_dir` rather than a
+  `live_path`, because a BPP solution needs one file per bin (`.live_solution_bin{k}.svg`).
+* **`clamp_to_container` (new, BPP-only).** The unbounded coordinate descent in `search_placement` can
+  walk an item outside a large, sparsely filled bin, where the quadtree cannot index it — the
+  specialized collision pipeline then misses collisions against it. `worker::clamp_to_container` clamps
+  the translation using the item's **rotated** bbox (`transform_from` with rotation only, which matches
+  how `PlacedItem::new` builds the placed shape). This cannot occur in SPP, where the strip is always
+  fitted tightly around the items, so SPP semantics stay untouched. When the item does not fit in the
+  container in its current rotation, the transformation is left alone. Moves that were clamped skip the
+  "weighted loss never increases" debug assertion, since the clamped transformation is not the one the
+  evaluator scored.
+* **`n_scatter_retries`** was added to `BPExplorationConfig` (not in the spec): consecutive failed
+  attempts target the 1st, 2nd, … least dense bin, so retries are different subproblems.
+
+### Deferred
+
+* **Cross-layout moves during separation** (spec called them "a later extension"). Requires a
+  transactional remove/place helper because `remove_item` auto-closes single-item layouts, invalidating
+  `LayKey`s and changing the bin count mid-move. Hook documented in `worker::move_items`.
+* **Cross-layout disruption swaps** — same reason.
+* **Iteration-based terminator** for the determinism smoke test the spec asked for. Only a wall-clock
+  terminator exists, so two same-seed runs complete a different number of iterations and a strict
+  equality test would be flaky. The determinism *properties* (index-ordered merge, derived RNGs, no
+  `HashMap`) are in place and documented in `docs/bpp.md`; the test is left out rather than made flaky.
+* **Search over the bin type mix.** Bin types are chosen greedily by lowest `cost / area` at the moment
+  a bin is opened.
+* **Consolidating more than one bin**, and consolidating along both axes.
+
+### Review findings fixed during phase 3
+
+* `src/util/bpp_io.rs` — `import_bp_solution` panicked (`attempt to subtract with overflow` in
+  jagua-rs `problem.rs:217`) on a warm start placing an item more often than demanded; now a clean
+  `Err`. Regression test: `tests/bpp_io_tests.rs::over_placed_item_is_rejected`.
+* `src/bpp_main.rs` — an incomplete warm start (fewer items placed than demanded) was silently
+  optimized and written out with items missing; now rejected, together with collision-free validation
+  of every warm-start layout.

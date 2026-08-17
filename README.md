@@ -74,6 +74,30 @@ cargo run --release -- \
     -i data/input/swim.json
 ```
 
+## Bin packing (`sparrow-bpp`)
+
+Next to the strip packing binary, this repo ships **`sparrow-bpp`**: the same heuristic, but packing all
+items into copies of **fixed-size bins** (sheets/plates) while minimising **how many bins are used**,
+with the leftover material consolidated into a single offcut as a secondary objective.
+
+Any existing strip packing instance can be run as a bin packing problem by declaring the bin geometry
+on the command line:
+
+```bash
+cargo run --release --bin sparrow-bpp -- \
+    -i data/input/swim.json \
+    --bin 3200x3200 \
+    -t 600
+```
+
+`--bin WxH[:stock[:cost]]` is repeatable (`stock` defaults to 1000, `cost` to 1). Instances that already
+declare their own `bins` are read as-is, and a previous `output/final_{name}.json` can be fed back in as
+a warm start. Results are written to `output/final_{name}.json` plus one SVG per bin
+(`output/final_{name}_bin{k}.svg`).
+
+📖 **See [`docs/bpp.md`](docs/bpp.md)** for the full documentation: input formats, all CLI options, how
+the algorithm works, determinism notes and known limitations.
+
 ## Visualizer
 
 This repo contains a simple visualizer to monitor the optimization process live.

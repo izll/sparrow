@@ -107,6 +107,21 @@ fn main() -> Result<()> {
     info!("[MAIN] loaded instance {} with #{} items and {} bin type(s)", ext_instance.name, instance.total_item_qty(), instance.bins.len());
     if let Some(init_sol) = &initial_solution {
         info!("[MAIN] warm start solution: {}", bpp_io::summarize(init_sol, &instance));
+
+        // A warm start is fed straight into `BPProblem::restore`, which does not (and cannot)
+        // invent placements for missing demand. An incomplete solution would therefore be
+        // optimized — and written out — with items silently missing, so reject it here.
+        let n_placed: usize = init_sol.layout_snapshots.values().map(|ls| ls.placed_items.len()).sum();
+        if n_placed != instance.total_item_qty() {
+            bail!("the warm start solution places {n_placed} item(s) but the instance demands {}; \
+                   it does not cover the full demand", instance.total_item_qty());
+        }
+        // Likewise, `restore` trusts the snapshots: verify they are actually collision-free.
+        for (lkey, ls) in init_sol.layout_snapshots.iter() {
+            if !jagua_rs::entities::Layout::from_snapshot(ls).is_feasible() {
+                bail!("layout {lkey:?} of the warm start solution is not collision-free");
+            }
+        }
     }
 
     let final_svg_path = format!("{OUTPUT_DIR}/final_{}.svg", ext_instance.name);
