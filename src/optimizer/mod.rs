@@ -14,9 +14,10 @@ use rand::rngs::Xoshiro256PlusPlus;
 
 pub mod lbf;
 pub mod separator;
-mod worker;
+pub mod worker;
 pub mod explore;
 pub mod compress;
+pub mod bpp;
 
 ///Algorithm 11 from https://doi.org/10.48550/arXiv.2509.13329
 pub fn optimize(
