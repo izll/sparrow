@@ -1,8 +1,10 @@
 use crate::consts::OVERLAP_PROXY_EPSILON_DIAM_RATIO;
-use crate::quantify::overlap_proxy::overlap_area_proxy;
+use crate::quantify::circles_soa::CirclesSoA;
+use crate::quantify::overlap_proxy::{overlap_area_proxy, overlap_area_proxy_soa};
 use jagua_rs::geometry::geo_traits::DistanceTo;
 use jagua_rs::geometry::primitives::{Rect, SPolygon};
 
+pub mod circles_soa;
 pub mod overlap_proxy;
 mod pair_matrix;
 pub mod tracker;
@@ -18,6 +20,26 @@ pub fn quantify_collision_poly_poly(s1: &SPolygon, s2: &SPolygon) -> f32 {
     let overlap_proxy = overlap_area_proxy(s1.surrogate(), s2.surrogate(), epsilon) + epsilon.powi(2);
 
     debug_assert!(overlap_proxy.is_normal());
+
+    let penalty = calc_shape_penalty(s1, s2);
+
+    overlap_proxy.sqrt() * penalty
+}
+
+/// Same as [`quantify_collision_poly_poly`], but with the poles of `s2` provided in SoA layout (`poles2`),
+/// enabling the (auto)vectorized overlap proxy. Use this when the same `s2` is quantified against many `s1`.
+#[inline(always)]
+pub fn quantify_collision_poly_poly_soa(s1: &SPolygon, s2: &SPolygon, poles2: &CirclesSoA) -> f32 {
+    debug_assert!(poles2.n == s2.surrogate().poles.len(), "SoA poles must match the poles of s2");
+    let epsilon = f32::max(s1.diameter, s2.diameter) * OVERLAP_PROXY_EPSILON_DIAM_RATIO;
+
+    let overlap_proxy = overlap_area_proxy_soa(s1.surrogate(), poles2, epsilon) + epsilon.powi(2);
+
+    debug_assert!(overlap_proxy.is_normal());
+    debug_assert!(
+        float_cmp::approx_eq!(f32, overlap_proxy, overlap_area_proxy(s1.surrogate(), s2.surrogate(), epsilon) + epsilon.powi(2), epsilon = overlap_proxy * 1e-3),
+        "SoA and sequential overlap proxies do not match"
+    );
 
     let penalty = calc_shape_penalty(s1, s2);
 

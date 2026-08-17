@@ -61,8 +61,12 @@ Pressing 'Ctrl + C' immediately moves the algorithm to the next phase, or termin
 -c, --compression <COMPRESSION>  Set the compression phase time limit (in seconds)
 -x, --early-termination          Enable early termination of the optimization process
 -s, --rng-seed <RNG_SEED>        Fixed seed for the random number generator
+-p, --parallel-runs <N>          Run N independent optimizations in parallel (seed, seed+1, ...) and keep the best (default: 1)
 -h, --help                       Print help
 ```
+
+`-p N` makes use of otherwise idle CPU cores: every run uses its own worker threads (3 by default), so on an 8-core machine
+`-p 2`..`-p 4` gives 2-4 shots at the same time limit for a small per-run slowdown.
 
 **Concrete example**:
 ```bash
@@ -121,12 +125,13 @@ The final solution is saved both in SVG and JSON format in `output/final_{name}.
 ## Targeting maximum performance
 
 This crate is highly optimized and is floating-point heavy.
-To enable the maximum performance, make sure `target-cpu=native` compiler flag is set, 
-switch to the nightly toolchain (required for [SIMD](https://doc.rust-lang.org/std/simd/index.html) support) 
-and enable the `simd` feature:
+The hottest loop (pole-pole overlap proxy) is written in SoA layout so that it auto-vectorizes on stable Rust,
+and `.cargo/config.toml` sets `target-cpu=native` for x86_64/aarch64 builds (AVX2 → 8-wide vector code).
+Remove or override that flag (`RUSTFLAGS`) if the binary has to run on a different CPU than the build machine.
+
+Optionally, the nightly-only `simd` feature uses [`std::simd`](https://doc.rust-lang.org/std/simd/index.html) explicitly:
 
 ```bash
-  export RUSTFLAGS='-C target-cpu=native'
   export RUSTUP_TOOLCHAIN=nightly
   cargo run --release --features=simd,only_final_svg -- \
       -i data/input/swim.json

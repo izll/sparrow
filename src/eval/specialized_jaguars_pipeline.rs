@@ -1,8 +1,7 @@
+use crate::quantify::circles_soa::CirclesSoA;
 use crate::quantify::quantify_collision_poly_container;
 #[cfg(not(feature = "simd"))]
-use crate::quantify::quantify_collision_poly_poly;
-#[cfg(feature = "simd")]
-use crate::quantify::simd::circles_soa::CirclesSoA;
+use crate::quantify::quantify_collision_poly_poly_soa;
 #[cfg(feature = "simd")]
 use crate::quantify::simd::quantify_collision_poly_poly_simd;
 use crate::quantify::tracker::CollisionTracker;
@@ -35,9 +34,6 @@ pub fn collect_poly_collisions_in_detector_custom(
     // transform the shape buffer to the new position
     let shape = shape_buffer.transform_from(reference_shape, &t);
 
-    #[cfg(feature = "simd")]
-    collector.poles_soa.load(&shape.surrogate().poles);
-    
 
     {
         // We start off by checking a few poles in order to detect obvious collisions quickly and quickly raise the loss.
@@ -100,8 +96,10 @@ pub struct SpecializedHazardCollector<'a> {
     pub idx_counter: usize,
     pub loss_cache: (usize, f32),
     pub loss_bound: f32,
-    #[cfg(feature = "simd")]
+    /// Poles of the shape currently being evaluated, in SoA layout (for vectorized quantification).
+    /// Loaded lazily, the first time a loss has to be quantified for the current shape.
     pub poles_soa: CirclesSoA,
+    poles_soa_loaded: bool,
 }
 
 impl<'a> SpecializedHazardCollector<'a> {
@@ -120,8 +118,8 @@ impl<'a> SpecializedHazardCollector<'a> {
             idx_counter: 0,
             loss_cache: (0, 0.0),
             loss_bound: f32::INFINITY,
-            #[cfg(feature = "simd")]
             poles_soa: CirclesSoA::new(),
+            poles_soa_loaded: false,
         }
     }
 
@@ -130,6 +128,7 @@ impl<'a> SpecializedHazardCollector<'a> {
         self.idx_counter = 0;
         self.loss_cache = (0, 0.0);
         self.loss_bound = loss_bound;
+        self.poles_soa_loaded = false;
     }
 
     pub fn iter_with_index(&self) -> impl Iterator<Item=&(HazardEntity, usize)> {
@@ -144,6 +143,11 @@ impl<'a> SpecializedHazardCollector<'a> {
         let (cache_idx, cached_loss) = self.loss_cache;
         if cache_idx < self.idx_counter {
             // additional hazards were detected, update the cache
+            if !self.poles_soa_loaded {
+                // first quantification for this shape: load its poles in SoA layout (vectorized overlap proxy)
+                self.poles_soa.load(&shape.surrogate().poles);
+                self.poles_soa_loaded = true;
+            }
             let extra_loss: f32 = self.iter_with_index()
                 .filter(|(_, idx)| *idx >= cache_idx)
                 .map(|(h, _)| self.calc_weighted_loss(h, shape))
@@ -160,7 +164,7 @@ impl<'a> SpecializedHazardCollector<'a> {
                 let other_shape = &self.layout.placed_items[*other_pk].shape;
 
                 #[cfg(not(feature = "simd"))]
-                let loss = quantify_collision_poly_poly(other_shape, shape);
+                let loss = quantify_collision_poly_poly_soa(other_shape, shape, &self.poles_soa);
                 #[cfg(feature = "simd")]
                 let loss = quantify_collision_poly_poly_simd(other_shape, shape, &self.poles_soa);
 

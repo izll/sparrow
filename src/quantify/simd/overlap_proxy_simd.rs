@@ -1,5 +1,5 @@
 use crate::quantify::overlap_proxy::overlap_area_proxy;
-use crate::quantify::simd::circles_soa::CirclesSoA;
+use crate::quantify::circles_soa::CirclesSoA;
 use float_cmp::approx_eq;
 use jagua_rs::geometry::fail_fast::SPSurrogate;
 use jagua_rs::geometry::geo_traits::DistanceTo;

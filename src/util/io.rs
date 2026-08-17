@@ -34,6 +34,12 @@ pub struct MainCli {
 
     #[arg(short = 's', long, help = "Fixed seed for the random number generator")]
     pub rng_seed: Option<u64>,
+
+    /// Number of independent optimizations to run in parallel (different seeds), keeping the best final solution
+    #[arg(short = 'p', long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..),
+        help = "Run N independent optimizations in parallel (seed, seed+1, ...) within the same time limit and keep the best result. \
+                Uses otherwise idle CPU cores; each run uses its own worker threads (see #workers in the log)")]
+    pub parallel_runs: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

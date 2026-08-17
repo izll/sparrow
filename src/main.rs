@@ -17,6 +17,7 @@ use anyhow::{bail, Result};
 use rand::rngs::Xoshiro256PlusPlus;
 use sparrow::consts::{DEFAULT_COMPRESS_TIME_RATIO, DEFAULT_EXPLORE_TIME_RATIO, DEFAULT_FAIL_DECAY_RATIO_CMPR, DEFAULT_MAX_CONSEQ_FAILS_EXPL, LOG_LEVEL_FILTER_DEBUG, LOG_LEVEL_FILTER_RELEASE};
 use sparrow::util::ctrlc_terminator::CtrlCTerminator;
+use sparrow::util::listener::{ReportType, SolutionListener};
 use sparrow::util::svg_exporter::SvgExporter;
 
 pub const OUTPUT_DIR: &str = "output";
@@ -61,19 +62,27 @@ fn main() -> Result<()>{
 
     info!("[MAIN] configured to explore for {}s and compress for {}s", explore_dur.as_secs(), compress_dur.as_secs());
 
-    let rng = match config.rng_seed {
+    let seed = match config.rng_seed {
         Some(seed) => {
             info!("[MAIN] using seed: {}", seed);
-            Xoshiro256PlusPlus::seed_from_u64(seed as u64)
+            seed as u64
         },
         None => {
             let seed = rand::random();
             warn!("[MAIN] no seed provided, using: {}", seed);
-            Xoshiro256PlusPlus::seed_from_u64(seed)
+            seed
         }
     };
 
-    info!("[MAIN] system time: {}", jiff::Timestamp::now());
+    let n_runs = args.parallel_runs as usize;
+    if n_runs > 1 {
+        let n_threads = n_runs * config.expl_cfg.separator_config.n_workers.max(config.cmpr_cfg.separator_config.n_workers);
+        info!("[MAIN] running {} independent optimizations in parallel (seeds {}..={}), keeping the best", n_runs, seed, seed + n_runs as u64 - 1);
+        if n_threads > num_cpus::get() {
+            warn!("[MAIN] {} runs x {} workers = {} threads > {} logical CPUs, runs will slow each other down",
+                n_runs, n_threads / n_runs, n_threads, num_cpus::get());
+        }
+    }
 
     let (ext_instance, ext_solution) = io::read_spp_input(Path::new(&input_file_path))?;
 
@@ -86,37 +95,68 @@ fn main() -> Result<()>{
 
     info!("[MAIN] loaded instance {} with #{} items", ext_instance.name, instance.total_item_qty());
     
-    let mut svg_exporter = {
-        let final_svg_path = Some(format!("{OUTPUT_DIR}/final_{}.svg", ext_instance.name));
+    let final_svg_path = format!("{OUTPUT_DIR}/final_{}.svg", ext_instance.name);
+    let intermediate_svg_dir = match cfg!(feature = "only_final_svg") {
+        true => None,
+        false => Some(format!("{OUTPUT_DIR}/sols_{}", ext_instance.name))
+    };
+    let live_svg_path = match cfg!(feature = "live_svg") {
+        true => Some(format!("{LIVE_DIR}/.live_solution.svg")),
+        false => None
+    };
 
-        let intermediate_svg_dir = match cfg!(feature = "only_final_svg") {
-            true => None,
-            false => Some(format!("{OUTPUT_DIR}/sols_{}", ext_instance.name))
-        };
+    // Set up the Ctrl-C handler once (before spawning any runs)
+    let ctrlc_terminator = CtrlCTerminator::new();
 
-        let live_svg_path = match cfg!(feature = "live_svg") {
-            true => Some(format!("{LIVE_DIR}/.live_solution.svg")),
-            false => None
-        };
-        
-        SvgExporter::new(
-            final_svg_path,
-            intermediate_svg_dir,
-            live_svg_path
+    // Runs one complete optimization (seed `run_seed`) and returns its final solution
+    let run_optimization = |run_idx: usize, run_seed: u64| -> jagua_rs::probs::spp::entities::SPSolution {
+        let rng = Xoshiro256PlusPlus::seed_from_u64(run_seed);
+        // Every run gets its own SVG exporter; the final SVG is written by the main thread for the best run only.
+        let mut svg_exporter = SvgExporter::new(
+            if n_runs == 1 { Some(final_svg_path.clone()) } else { None },
+            intermediate_svg_dir.as_ref().map(|d| if n_runs == 1 { d.clone() } else { format!("{d}/run_{run_idx}") }),
+            if run_idx == 0 { live_svg_path.clone() } else { None },
+        );
+        let mut terminator = ctrlc_terminator.clone();
+        optimize(
+            instance.clone(),
+            rng,
+            &mut svg_exporter,
+            &mut terminator,
+            &config.expl_cfg,
+            &config.cmpr_cfg,
+            initial_solution.as_ref()
         )
     };
-    
-    let mut ctrlc_terminator = CtrlCTerminator::new();
 
-    let solution = optimize(
-        instance.clone(),
-        rng,
-        &mut svg_exporter,
-        &mut ctrlc_terminator,
-        &config.expl_cfg,
-        &config.cmpr_cfg,
-        initial_solution.as_ref()
-    );
+    let solution = if n_runs == 1 {
+        run_optimization(0, seed)
+    } else {
+        // Run all optimizations concurrently on their own (named) threads and collect the results
+        let solutions: Vec<(usize, jagua_rs::probs::spp::entities::SPSolution)> = std::thread::scope(|scope| {
+            let handles = (0..n_runs).map(|run_idx| {
+                let run_optimization = &run_optimization;
+                std::thread::Builder::new()
+                    .name(format!("run-{run_idx}"))
+                    .spawn_scoped(scope, move || (run_idx, run_optimization(run_idx, seed + run_idx as u64)))
+                    .expect("failed to spawn optimization thread")
+            }).collect::<Vec<_>>();
+            handles.into_iter().map(|h| h.join().expect("optimization thread panicked")).collect()
+        });
+
+        for (run_idx, sol) in solutions.iter() {
+            info!("[MAIN] run {} (seed {}): width: {:.3}, density: {:.3}%", run_idx, seed + *run_idx as u64, sol.strip_width(), sol.density(&instance) * 100.0);
+        }
+        let (best_idx, best_sol) = solutions.into_iter()
+            .min_by(|(_, a), (_, b)| a.strip_width().partial_cmp(&b.strip_width()).unwrap())
+            .expect("at least one run");
+        info!("[MAIN] best run: {} (seed {}), width: {:.3}, density: {:.3}%", best_idx, seed + best_idx as u64, best_sol.strip_width(), best_sol.density(&instance) * 100.0);
+
+        // Export the final SVG of the best run
+        SvgExporter::new(Some(final_svg_path.clone()), None, None)
+            .report(ReportType::Final, &best_sol, &instance);
+        best_sol
+    };
 
     let json_path = format!("{OUTPUT_DIR}/final_{}.json", ext_instance.name);
     let json_output = ExtSPOutput {

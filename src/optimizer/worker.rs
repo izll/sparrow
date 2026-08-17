@@ -28,7 +28,8 @@ impl SeparatorWorker {
         // restores the state of the worker to the given solution and accompanying tracker
         debug_assert!(sol.strip_width() == self.prob.strip_width());
         self.prob.restore(sol);
-        self.ct = ct.clone();
+        // clone_from reuses the worker's existing allocations (pair matrix etc.) instead of reallocating every iteration
+        self.ct.clone_from(ct);
     }
 
     /// Algorithm 5 from https://doi.org/10.48550/arXiv.2509.13329

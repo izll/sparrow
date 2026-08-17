@@ -1,4 +1,11 @@
 # .cargo/config.toml
+
+# Compile for the CPU of the build machine (AVX2/FMA on modern x86-64): enables 8-wide auto-vectorization of the
+# overlap-proxy loops and better codegen overall. Remove this section (or override with RUSTFLAGS) if the binary
+# needs to run on a different/older CPU than the one it was built on.
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))']
+rustflags = ["-C", "target-cpu=native"]
+
 [target.wasm32-unknown-unknown]
 rustflags = [
     "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128"

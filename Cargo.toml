@@ -58,6 +58,8 @@ debug = true
 [profile.release]
 opt-level = 3
 lto = "fat"
+codegen-units = 1
+panic = "abort"
 
 [profile.test]
 opt-level = 3

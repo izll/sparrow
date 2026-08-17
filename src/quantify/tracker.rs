@@ -1,12 +1,21 @@
 use crate::consts::{GLS_WEIGHT_DECAY, GLS_WEIGHT_MAX_INC_RATIO, GLS_WEIGHT_MIN_INC_RATIO};
 use crate::quantify::pair_matrix::PairMatrix;
-use crate::quantify::{quantify_collision_poly_container, quantify_collision_poly_poly};
+use crate::quantify::circles_soa::CirclesSoA;
+use crate::quantify::{quantify_collision_poly_container, quantify_collision_poly_poly_soa};
 use crate::util::assertions::tracker_matches_layout;
 use jagua_rs::collision_detection::hazards::collector::{BasicHazardCollector, HazardCollector};
 use jagua_rs::collision_detection::hazards::HazardEntity;
 use jagua_rs::entities::{Layout, PItemKey};
+use itertools::Itertools;
 use ordered_float::Float;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use slotmap::SecondaryMap;
+
+/// Collision losses of a single item: against the container and against other items (by tracker index)
+struct ItemLosses {
+    container: f32,
+    pairs: Vec<(usize, f32)>,
+}
 
 /// Tracker of both collisions between pair of items and collisions with the container.
 /// It also stores the weights for every pair of hazards and is used as a cache for collisions.
@@ -34,26 +43,26 @@ impl CollisionTracker {
             container_collisions: vec![CTEntry { weight: 1.0, loss: 0.0 }; size],
         };
 
-        // Recompute the loss for all items
-        l.placed_items.keys().for_each(|pk| {
-            ot.recompute_loss_for_item(pk, l)
-        });
+        // Compute the losses for all items (in parallel, the computation is read-only w.r.t. the layout and tracker),
+        // and subsequently write them into the (fresh, all zero) tracker.
+        let pks = l.placed_items.keys().collect_vec();
+        let item_losses: Vec<ItemLosses> = pks.par_iter()
+            .map(|&pk| ot.compute_losses_for_item(pk, l))
+            .collect();
+
+        for (pk, losses) in pks.into_iter().zip(item_losses) {
+            ot.store_losses_for_item(pk, losses);
+        }
 
         debug_assert!(tracker_matches_layout(&ot, l));
 
         ot
     }
 
-    fn recompute_loss_for_item(&mut self, pk: PItemKey, l: &Layout) {
-        let idx = self.pk_idx_map[pk];
+    /// Computes the collision losses of a single item against all other hazards in the layout (without modifying the tracker).
+    fn compute_losses_for_item(&self, pk: PItemKey, l: &Layout) -> ItemLosses {
         let pi = &l.placed_items[pk];
         let shape = &pi.shape;
-
-        // Reset all current loss values for the item
-        for i in 0..self.size {
-            self.pair_collisions[(idx, i)].loss = 0.0;
-        }
-        self.container_collisions[idx].loss = 0.0;
 
         // Compute which hazards are currently colliding with the item
         let mut collector = BasicHazardCollector::with_capacity(l.placed_items.len() + 1);
@@ -61,25 +70,57 @@ impl CollisionTracker {
         // Remove the item itself from the detector
         collector.remove_by_entity(&HazardEntity::from((pk, pi)));
 
-        // For each colliding hazard, quantify the collision and store it in the tracker
+        let mut losses = ItemLosses { container: 0.0, pairs: Vec::with_capacity(collector.len()) };
+        if collector.is_empty() {
+            return losses;
+        }
+
+        // Poles of the item in SoA layout (vectorized quantification against all colliding items)
+        let poles_soa = CirclesSoA::from_circles(&shape.surrogate().poles);
+
+        // For each colliding hazard, quantify the collision
         for (_, haz) in collector.iter() {
             match haz {
                 HazardEntity::PlacedItem { pk: other_pk, .. } => {
                     let shape_other = &l.placed_items[*other_pk].shape;
                     let idx_other = self.pk_idx_map[*other_pk];
 
-                    let loss = quantify_collision_poly_poly(shape, shape_other);
+                    let loss = quantify_collision_poly_poly_soa(shape_other, shape, &poles_soa);
                     assert!(loss > 0.0, "loss for a collision should be > 0.0");
-                    self.pair_collisions[(idx, idx_other)].loss = loss;
+                    losses.pairs.push((idx_other, loss));
                 }
                 HazardEntity::Exterior => {
                     let loss = quantify_collision_poly_container(shape, l.container.outer_cd.bbox);
                     assert!(loss > 0.0, "loss for a collision should be > 0.0");
-                    self.container_collisions[idx].loss = loss;
+                    losses.container = loss;
                 }
                 _ => unimplemented!("unsupported hazard entity"),
             }
         }
+        losses
+    }
+
+    /// Stores previously computed losses of an item in the tracker (does not reset any existing entries).
+    fn store_losses_for_item(&mut self, pk: PItemKey, losses: ItemLosses) {
+        let idx = self.pk_idx_map[pk];
+        self.container_collisions[idx].loss = losses.container;
+        for (idx_other, loss) in losses.pairs {
+            self.pair_collisions[(idx, idx_other)].loss = loss;
+        }
+    }
+
+    fn recompute_loss_for_item(&mut self, pk: PItemKey, l: &Layout) {
+        let idx = self.pk_idx_map[pk];
+
+        // Reset all current loss values for the item
+        for i in 0..self.size {
+            self.pair_collisions[(idx, i)].loss = 0.0;
+        }
+        self.container_collisions[idx].loss = 0.0;
+
+        // Recompute and store
+        let losses = self.compute_losses_for_item(pk, l);
+        self.store_losses_for_item(pk, losses);
     }
 
     pub fn restore_but_keep_weights(&mut self, cts: &CTSnapshot, layout: &Layout) {
