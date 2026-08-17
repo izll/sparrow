@@ -38,7 +38,14 @@ pub struct Separator {
 }
 
 impl Separator {
-    pub fn new(instance: SPInstance, prob: SPProblem, mut rng: Xoshiro256PlusPlus, config: SeparatorConfig) -> Self {
+    pub fn new(instance: SPInstance, prob: SPProblem, mut rng: Xoshiro256PlusPlus, mut config: SeparatorConfig) -> Self {
+        // MÉRÉSHEZ (MADisoCAD): a szálszám kívülről állítható, hogy ugyanazon a
+        // bemeneten összehasonlítható legyen 1 / 3 / 8 / 16 worker.
+        if let Ok(v) = std::env::var("SPARROW_N_WORKERS") {
+            if let Ok(n) = v.parse::<usize>() {
+                if n > 0 { config.n_workers = n; }
+            }
+        }
         let ct = CollisionTracker::new(&prob.layout);
         let workers = (0..config.n_workers).map(|_|
             SeparatorWorker {
@@ -172,7 +179,7 @@ impl Separator {
 
         // Load this 'best' solution into the master, effectively throwing away all other work.
         self.prob.restore(&best_sol);
-        self.ct = best_ct.clone();
+        self.ct.clone_from(best_ct);
 
         sep_report
     }
