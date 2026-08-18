@@ -99,6 +99,40 @@ a warm start. Results are written to `output/final_{name}.json` plus one SVG per
 📖 **See [`docs/bpp.md`](docs/bpp.md)** for the full documentation: input formats, all CLI options, how
 the algorithm works, determinism notes and known limitations.
 
+## Multi-sheet strip packing (`--sheet-width`)
+
+If the material comes as **fixed-size sheets** (e.g. 2000 x 1000 mm), neither of the two modes above
+fits directly: cutting a strip solution at multiples of the sheet width slices through every part that
+straddles a boundary, while `sparrow-bpp` minimises the bin count but leaves the leftover badly
+distributed.
+
+The **walled** mode solves both at once. It inserts a wall at every sheet boundary (as a `Hole`
+hazard), so no part can ever straddle a boundary, while keeping the strip engine's full global
+compaction — sheet 1 fills up, then sheet 2, and only the last sheet is left with an unused end band:
+
+```bash
+cargo run --release -- \
+    -i data/input/swim.json \
+    --sheet-width 2000 \
+    -e 30 -c 20
+```
+
+The number of sheets is `ceil(width / (sheet-width + gap))`, so minimising the strip width minimises
+the sheet count as a direct consequence. `--sheet-gap` sets the (virtual, material-free) wall
+thickness; it defaults to `max(20, 2 * min-sep)`. Without `--sheet-width` behaviour is unchanged.
+
+A per-sheet report is logged, including the **reusable leftover band** of each sheet:
+
+```
+[SHEET] [FINAL] 4 sheet(s) of 2000 (+20 gap), last sheet used width 1160.6
+[SHEET] sheet 0: 27 items, used 1999.3/2000 mm, dens 73.9%, leftover band 0.7 mm
+...
+[SHEET] leftover: 2342744 mm2 total (29.3%) = band (reusable) 843542 mm2 (10.5%) + internal gaps 1499203 mm2 (18.7%)
+```
+
+📖 **See [`docs/sheets.md`](docs/sheets.md)** for the geometry and coordinate mapping, min-sep semantics
+at walls, measured results on real instances, and known limitations.
+
 ## Visualizer
 
 This repo contains a simple visualizer to monitor the optimization process live.

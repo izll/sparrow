@@ -1,5 +1,7 @@
+use crate::config::SheetConfig;
 use crate::eval::lbf_evaluator::LBFEvaluator;
 use crate::eval::sample_eval::SampleEval;
+use crate::optimizer::sheets::apply_sheet_walls_opt;
 use crate::sample::search::{search_placement, SampleConfig};
 use crate::util::assertions;
 use itertools::Itertools;
@@ -17,6 +19,9 @@ pub struct LBFBuilder {
     pub prob: SPProblem,
     pub rng: Xoshiro256PlusPlus,
     pub sample_config: SampleConfig,
+    /// Multi-sheet ("walled") mode; the walls are re-applied after every strip width change so that
+    /// the constructor never places an item across a sheet boundary. See [`crate::optimizer::sheets`].
+    pub sheet: Option<SheetConfig>,
 }
 
 impl LBFBuilder {
@@ -25,13 +30,25 @@ impl LBFBuilder {
         rng: Xoshiro256PlusPlus,
         sample_config: SampleConfig,
     ) -> Self {
-        let prob = SPProblem::new(instance.clone());
+        Self::new_with_sheet(instance, rng, sample_config, None)
+    }
+
+    /// Like [`LBFBuilder::new`], but for the multi-sheet ("walled") mode.
+    pub fn new_with_sheet(
+        instance: SPInstance,
+        rng: Xoshiro256PlusPlus,
+        sample_config: SampleConfig,
+        sheet: Option<SheetConfig>,
+    ) -> Self {
+        let mut prob = SPProblem::new(instance.clone());
+        apply_sheet_walls_opt(&mut prob, sheet.as_ref());
 
         Self {
             instance,
             prob,
             rng,
             sample_config,
+            sheet,
         }
     }
 
@@ -58,6 +75,7 @@ impl LBFBuilder {
         }
 
         self.prob.fit_strip();
+        apply_sheet_walls_opt(&mut self.prob, self.sheet.as_ref());
         debug!("[CONSTR] placed all items in width: {:.3} (in {:?})",self.prob.strip_width(), start.elapsed());
         self
     }
@@ -71,6 +89,7 @@ impl LBFBuilder {
             None => {
                 debug!("[CONSTR] failed to place item with id {}, expanding strip width",item_id);
                 self.prob.change_strip_width(self.prob.strip_width() * 1.2);
+                apply_sheet_walls_opt(&mut self.prob, self.sheet.as_ref());
                 assert!(assertions::strip_width_is_in_check(&self.prob), "strip-width is running away (>{:.3}), item {item_id} does not seem to fit into the strip", self.prob.strip_width());          
                 self.place_item(item_id);
             }

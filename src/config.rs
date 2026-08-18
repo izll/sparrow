@@ -5,6 +5,57 @@ use jagua_rs::geometry::fail_fast::SPSurrogateConfig;
 use crate::optimizer::bpp::shelf::Constructive;
 use std::time::Duration;
 
+
+/// Configuration of the **multi-sheet ("walled") strip packing** mode
+/// (see [`crate::optimizer::sheets`]).
+///
+/// When present, a wall is inserted into the strip at every sheet boundary, so no item can straddle
+/// a boundary and the strip can be cut into physical sheets of `width` without relocating anything.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SheetConfig {
+    /// Usable width of one physical sheet (mm). Sheet height = the instance's strip height.
+    pub width: f32,
+    /// Thickness of the (virtual) wall between two consecutive sheets (mm).
+    ///
+    /// The sheets are separate physical objects, so this gap costs nothing; making it thick gives
+    /// the wall a well-covered pole surrogate and therefore a smooth GLS loss gradient.
+    /// See [`SheetConfig::resolve_gap`].
+    pub gap: f32,
+    /// **Post-pass hook (phase 8, not yet implemented).** When enabled, after the compression phase
+    /// every sheet except the last one would be re-compacted to the left *within its own sheet*, so
+    /// the leftover of each sheet becomes one wide, reusable right-hand band instead of many small
+    /// gaps between the parts.
+    ///
+    /// This is a purely *secondary* objective: it cannot reduce the sheet count (that is already
+    /// minimised by the walled strip width), it only redistributes the slack inside a sheet. The
+    /// intended implementation mirrors the BPP `consolidate_layout`: build an SPP sub-problem from
+    /// one sheet's items with the strip height fixed, run the separator on it for a share of a small
+    /// budget, translate the result back, and accept only if the whole layout stays feasible and no
+    /// item crosses a wall. Currently ignored; see `docs/sheets.md`.
+    pub compact_sheets: bool,
+}
+
+/// Default wall thickness when `--sheet-gap` is not given: at least [`MIN_DEFAULT_SHEET_GAP`] mm,
+/// and never less than twice the minimum item separation (so the wall stays thicker than the
+/// clearance it has to enforce).
+pub const MIN_DEFAULT_SHEET_GAP: f32 = 20.0;
+
+impl SheetConfig {
+    /// Distance between the left edges of two consecutive sheets: `width + gap`.
+    pub fn pitch(&self) -> f32 {
+        self.width + self.gap
+    }
+
+    /// Resolves the gap to use: the explicit CLI value if given, otherwise
+    /// `max(MIN_DEFAULT_SHEET_GAP, 2 * min_item_separation)`.
+    pub fn resolve_gap(cli_gap: Option<f32>, min_item_separation: Option<f32>) -> f32 {
+        match cli_gap {
+            Some(g) if g > 0.0 => g,
+            _ => MIN_DEFAULT_SHEET_GAP.max(2.0 * min_item_separation.unwrap_or(0.0)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SparrowConfig {
     pub rng_seed: Option<usize>,
@@ -25,6 +76,9 @@ pub struct SparrowConfig {
     /// Disabled if `None`.
     /// See [`jagua_rs::io::parser::Parser::new`] for more details.
     pub narrow_concavity_cutoff_ratio: Option<(f32, f32)>,
+    /// Multi-sheet ("walled") strip packing mode. `None` = plain strip packing (default), in which
+    /// case the behaviour is bit-identical to before this mode existed.
+    pub sheet: Option<SheetConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -34,7 +88,9 @@ pub struct ExplorationConfig {
     pub max_conseq_failed_attempts: Option<usize>,
     pub solution_pool_distribution_stddev: f32,
     pub separator_config: SeparatorConfig,
-    pub large_item_ch_area_cutoff_percentile: f32
+    pub large_item_ch_area_cutoff_percentile: f32,
+    /// See [`SparrowConfig::sheet`]. Propagated from there by [`SparrowConfig::apply_sheet`].
+    pub sheet: Option<SheetConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +99,8 @@ pub struct CompressionConfig {
     pub time_limit: Duration,
     pub shrink_decay: ShrinkDecayStrategy,
     pub separator_config: SeparatorConfig,
+    /// See [`SparrowConfig::sheet`]. Propagated from there by [`SparrowConfig::apply_sheet`].
+    pub sheet: Option<SheetConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,7 +129,8 @@ pub const DEFAULT_SPARROW_CONFIG: SparrowConfig = SparrowConfig {
                 n_coord_descents: 3,
             },
         },
-        large_item_ch_area_cutoff_percentile: 0.75
+        large_item_ch_area_cutoff_percentile: 0.75,
+        sheet: None,
     },
     cmpr_cfg: CompressionConfig {
         shrink_range: (0.0005, 0.00001),
@@ -88,6 +147,7 @@ pub const DEFAULT_SPARROW_CONFIG: SparrowConfig = SparrowConfig {
                 n_coord_descents: 3,
             },
         },
+        sheet: None,
     },
     cde_config: CDEConfig {
         quadtree_depth: 4,
@@ -101,7 +161,17 @@ pub const DEFAULT_SPARROW_CONFIG: SparrowConfig = SparrowConfig {
     poly_simpl_tolerance: Some(0.001),
     narrow_concavity_cutoff_ratio: Some((0.01, 0.01)),
     min_item_separation: None,
+    sheet: None,
 };
+
+impl SparrowConfig {
+    /// Enables the multi-sheet mode and propagates the setting to both phase configurations.
+    pub fn apply_sheet(&mut self, sheet: Option<SheetConfig>) {
+        self.sheet = sheet;
+        self.expl_cfg.sheet = sheet;
+        self.cmpr_cfg.sheet = sheet;
+    }
+}
 // ---------------------------------------------------------------------------------------------
 // Bin Packing Problem (BPP) configuration
 // ---------------------------------------------------------------------------------------------
@@ -280,6 +350,8 @@ pub const DEFAULT_BPP_CONFIG: BPConfig = BPConfig {
             solution_pool_distribution_stddev: 0.25,
             separator_config: DEFAULT_SPARROW_CONFIG.cmpr_cfg.separator_config,
             large_item_ch_area_cutoff_percentile: 0.75,
+            // The BPP pipeline packs into real bins; sheet walls are an SPP-only concept.
+            sheet: None,
         },
         pack_down: true,
         pack_down_move_time_limit: Duration::from_secs(2),

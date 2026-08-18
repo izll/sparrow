@@ -64,6 +64,18 @@ fn main() -> Result<()>{
         info!("[MAIN] minimum item separation: {sep} (items inflated and container deflated by {} each)", sep / 2.0);
     }
 
+    // Multi-sheet ("walled") strip mode, if requested
+    let sheet = args.sheet_width.map(|width| {
+        let gap = SheetConfig::resolve_gap(args.sheet_gap, config.min_item_separation);
+        SheetConfig { width, gap, compact_sheets: args.compact_sheets }
+    });
+    config.apply_sheet(sheet);
+    if let Some(sheet) = sheet {
+        info!("[MAIN] multi-sheet (walled) mode: sheet width {} mm, wall/gap {} mm; \
+               a wall is inserted at every multiple of {} mm so no item straddles a sheet boundary",
+            sheet.width, sheet.gap, sheet.pitch());
+    }
+
     info!("[MAIN] configured to explore for {}s and compress for {}s", explore_dur.as_secs(), compress_dur.as_secs());
 
     let seed = match config.rng_seed {
@@ -161,6 +173,10 @@ fn main() -> Result<()>{
             .report(ReportType::Final, &best_sol, &instance);
         best_sol
     };
+
+    if let Some(sheet) = sheet.as_ref() {
+        sparrow::optimizer::sheets::log_sheet_report("FINAL", &solution, &instance, sheet);
+    }
 
     let json_path = format!("{OUTPUT_DIR}/final_{}.json", ext_instance.name);
     let json_output = ExtSPOutput {

@@ -1,3 +1,5 @@
+use crate::config::SheetConfig;
+use crate::optimizer::sheets::apply_sheet_walls_opt;
 use crate::optimizer::worker::{SepStats, SeparatorWorker};
 use crate::optimizer::Terminator;
 use crate::quantify::tracker::{CTSnapshot, CollisionTracker};
@@ -35,10 +37,20 @@ pub struct Separator {
     pub workers: Vec<SeparatorWorker>,
     pub config: SeparatorConfig,
     pub thread_pool: Option<ThreadPool>,
+    /// Multi-sheet ("walled") mode. When `Some`, the sheet walls are (re-)applied after every
+    /// change of the strip width. `None` = plain strip packing. See [`crate::optimizer::sheets`].
+    pub sheet: Option<SheetConfig>,
 }
 
 impl Separator {
-    pub fn new(instance: SPInstance, prob: SPProblem, mut rng: Xoshiro256PlusPlus, mut config: SeparatorConfig) -> Self {
+    pub fn new(instance: SPInstance, prob: SPProblem, rng: Xoshiro256PlusPlus, config: SeparatorConfig) -> Self {
+        Self::new_with_sheet(instance, prob, rng, config, None)
+    }
+
+    /// Like [`Separator::new`], but for the multi-sheet ("walled") mode.
+    /// The caller is responsible for the walls already being present on `prob`'s layout;
+    /// from here on the separator re-applies them itself after every width change.
+    pub fn new_with_sheet(instance: SPInstance, prob: SPProblem, mut rng: Xoshiro256PlusPlus, mut config: SeparatorConfig, sheet: Option<SheetConfig>) -> Self {
         // MÉRÉSHEZ (MADisoCAD): a szálszám kívülről állítható, hogy ugyanazon a
         // bemeneten összehasonlítható legyen 1 / 3 / 8 / 16 worker.
         if let Ok(v) = std::env::var("SPARROW_N_WORKERS") {
@@ -72,6 +84,7 @@ impl Separator {
             workers,
             config,
             thread_pool: pool,
+            sheet,
         }
     }
 
@@ -245,6 +258,9 @@ impl Separator {
         }
 
         self.prob.change_strip_width(new_width);
+
+        //re-insert the sheet walls (the width change swapped in a plain, wall-less container)
+        apply_sheet_walls_opt(&mut self.prob, self.sheet.as_ref());
 
         //rebuild the collision tracker
         self.ct = CollisionTracker::new(&self.prob.layout);

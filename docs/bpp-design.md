@@ -446,3 +446,28 @@ RNGs derived from the master, no `HashMap` iteration, and `debug_assert!`s mirro
 * `src/bpp_main.rs` — an incomplete warm start (fewer items placed than demanded) was silently
   optimized and written out with items missing; now rejected, together with collision-free validation
   of every warm-start layout.
+
+---
+
+## Status note: phase 7 — multi-sheet strip mode as an alternative to BPP for identical sheets
+
+When every sheet is **identical** (the MADisoCAD case: one 2000 x 1000 plate), the BPP is no longer the
+only way to pack into sheets. Phase 7 added a **multi-sheet ("walled") strip packing mode** to the SPP
+binary: a wall is inserted at every sheet boundary, so no part straddles a boundary, and the strip's
+global GLS compaction is retained. The sheet count `ceil(width / (W + gap))` is then minimised as a
+consequence of minimising the strip width.
+
+This is an *alternative* to the BPP for that case, not a replacement of it — the BPP still handles
+mixed bin types, per-bin stock limits and costs, which a single strip cannot express.
+
+Measured against the BPP references (30 s + 20 s, seed 42):
+
+* **112 parts**: walled = 4 sheets at 73.9 / 71.5 / 87.4 / 50.4 %, versus bpp's 4 bins at
+  41.9 / 72.5 / 83.8 / 84.7 %. Same bin count, but the walled run concentrates *all* the slack into a
+  single 839 mm reusable band instead of spreading it — clearly better for reuse.
+* **iso6**: walled = 9 sheets, equal to the bpp result and to the proven lower bound of 9.
+* **iso7**: walled = 3 sheets, *worse* than the 2 sheets a cut free strip would give. The walls trap
+  the search in a 3-sheet arrangement because there is no cross-sheet relocation move. Diagnosed in
+  `docs/sheets.md`; a `pack_down`-style operator is the natural fix.
+
+The BPP pipeline itself is untouched by phase 7. See [`docs/sheets.md`](sheets.md).

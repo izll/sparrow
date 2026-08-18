@@ -1,6 +1,6 @@
 use crate::eval::specialized_jaguars_pipeline::SpecializedHazardCollector;
-use crate::quantify::tracker::CollisionTracker;
-use crate::quantify::{quantify_collision_poly_container, quantify_collision_poly_poly};
+use crate::quantify::tracker::{hole_shape, n_holes_of, CollisionTracker};
+use crate::quantify::{quantify_collision_poly_container, quantify_collision_poly_hole, quantify_collision_poly_poly};
 use float_cmp::{approx_eq, assert_approx_eq};
 use itertools::Itertools;
 use jagua_rs::collision_detection::hazards::collector::{BasicHazardCollector, HazardCollector};
@@ -129,6 +129,21 @@ pub fn tracker_matches_layout(ct: &CollisionTracker, l: &Layout) -> bool {
             assert_approx_eq!(f32, stored_loss, calc_loss, ulps = 5);
         } else {
             assert_eq!(ct.get_container_loss(pk1), 0.0);
+        }
+
+        // Verify the losses against the holes of the container (the sheet walls in the walled strip mode)
+        assert_eq!(ct.n_holes, n_holes_of(l), "tracker hole count does not match the layout's container");
+        for idx in 0..ct.n_holes {
+            let stored_loss = ct.get_hole_loss(pk1, idx);
+            if collector.contains_entity(&HazardEntity::Hole { idx }) {
+                let calc_loss = quantify_collision_poly_hole(&pi1.shape, hole_shape(l, idx).bbox);
+                assert!(
+                    approx_eq!(f32, calc_loss, stored_loss, epsilon = 0.10 * stored_loss.max(calc_loss)),
+                    "tracker error: hole {idx} loss {stored_loss} != {calc_loss}"
+                );
+            } else {
+                assert_eq!(stored_loss, 0.0, "tracker error: stored a loss for a non-colliding hole {idx}");
+            }
         }
     }
 

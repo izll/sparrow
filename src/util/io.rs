@@ -40,6 +40,26 @@ pub struct MainCli {
                 Items are inflated and the container is deflated by half this value each. Overrides the SPARROW_MIN_SEP env var")]
     pub min_item_separation: Option<f32>,
 
+    /// Usable width of one physical sheet (mm). Enables the multi-sheet ("walled") strip mode.
+    #[arg(long = "sheet-width", value_name = "MM", help = "Enable multi-sheet (walled) strip packing: insert a wall at every multiple of this sheet width (mm), \
+                so no item ever straddles a sheet boundary. The strip can then be cut into physical sheets of this width directly. \
+                Without this flag the behaviour is the plain strip packing one")]
+    pub sheet_width: Option<f32>,
+
+    /// Thickness of the virtual wall between two consecutive sheets (mm)
+    #[arg(long = "sheet-gap", value_name = "MM", requires = "sheet_width",
+        help = "Thickness of the (virtual) wall between two consecutive sheets (mm). The sheets are separate physical objects, \
+                so this costs no material; a thicker wall gives the separator a better gradient to push items off a boundary. \
+                Defaults to max(20, 2 * min-sep)")]
+    pub sheet_gap: Option<f32>,
+
+    /// Compact each sheet's items to the left within their own sheet after compression (phase 8, not yet implemented)
+    #[arg(long = "compact-sheets", requires = "sheet_width",
+        help = "After compression, re-compact every sheet except the last one within its own sheet, so the leftover of each \
+                sheet becomes one wide reusable band instead of many small gaps. Secondary objective only: it cannot reduce \
+                the sheet count. NOT YET IMPLEMENTED (accepted and reported, but currently a no-op)")]
+    pub compact_sheets: bool,
+
     /// Number of independent optimizations to run in parallel (different seeds), keeping the best final solution
     #[arg(short = 'p', long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..),
         help = "Run N independent optimizations in parallel (seed, seed+1, ...) within the same time limit and keep the best result. \

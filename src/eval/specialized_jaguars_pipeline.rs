@@ -1,10 +1,10 @@
 use crate::quantify::circles_soa::CirclesSoA;
-use crate::quantify::quantify_collision_poly_container;
+use crate::quantify::{quantify_collision_poly_container, quantify_collision_poly_hole};
 #[cfg(not(feature = "simd"))]
 use crate::quantify::quantify_collision_poly_poly_soa;
 #[cfg(feature = "simd")]
 use crate::quantify::simd::quantify_collision_poly_poly_simd;
-use crate::quantify::tracker::CollisionTracker;
+use crate::quantify::tracker::{hole_shape, CollisionTracker};
 use crate::util::assertions;
 use crate::util::bit_reversal_iterator::BitReversalIterator;
 use float_cmp::approx_eq;
@@ -176,7 +176,19 @@ impl<'a> SpecializedHazardCollector<'a> {
                 let weight = self.ct.get_container_weight(self.current_pk);
                 loss * weight
             }
-            _ => unimplemented!("unsupported hazard entity"),
+            HazardEntity::Hole { idx } => {
+                // A hole (quality-0 zone) is static container geometry; in the multi-sheet
+                // ("walled") mode every sheet boundary is one. Quantified by bbox overlap, see
+                // [`quantify_collision_poly_hole`] — holes have no pole surrogate, and for a long
+                // thin axis-aligned wall the exact bbox overlap is the better gradient anyway.
+                let loss = quantify_collision_poly_hole(shape, hole_shape(self.layout, *idx).bbox);
+                let weight = self.ct.get_hole_weight(self.current_pk, *idx);
+                loss * weight
+            }
+            // Inferior quality zones (quality > 0) are not supported by the separator: unlike holes
+            // they are only forbidden for *some* items, which the GLS tracker has no notion of.
+            HazardEntity::InferiorQualityZone { .. } =>
+                unimplemented!("inferior quality zones are not supported by the separator; only holes (quality 0) are"),
         }
     }
 }
