@@ -17,7 +17,27 @@ pub struct SampleConfig {
 }
 
 /// Algorithm 6 and Figure 7 from https://doi.org/10.48550/arXiv.2509.13329
-pub fn search_placement(l: &Layout, item: &Item, ref_pk: Option<PItemKey>, mut evaluator: impl SampleEvaluator, sample_config: SampleConfig, rng: &mut impl Rng) -> (Option<(DTransformation, SampleEval)>, usize) {
+pub fn search_placement(l: &Layout, item: &Item, ref_pk: Option<PItemKey>, evaluator: impl SampleEvaluator, sample_config: SampleConfig, rng: &mut impl Rng) -> (Option<(DTransformation, SampleEval)>, usize) {
+    search_placement_in(l, item, ref_pk, evaluator, sample_config, rng, None)
+}
+
+/// Like [`search_placement`], but the *container-wide* sampling stage is restricted to
+/// `sample_bbox` instead of covering the whole container.
+///
+/// This is what the walled mode's cross-sheet pack-down needs: an item is to be relocated into
+/// **one specific sheet**, so sampling the whole strip would waste (almost) all of the samples on
+/// the other sheets. Passing `Some(sheet_bbox)` concentrates every container-wide sample inside
+/// that sheet's x-range.
+///
+/// Note that only the *sampling* is restricted; the item is still required to lie inside the
+/// container as a whole (that is what [`UniformBBoxSampler`]'s third argument does), and the
+/// coordinate-descent refinement afterwards is free to walk out of `sample_bbox`. The caller is
+/// responsible for verifying the final placement (the walled pack-down re-checks that the item
+/// stayed on the target sheet).
+///
+/// With `sample_bbox = None` this is *exactly* [`search_placement`]: same sampler, same RNG draws,
+/// same result. Plain strip packing therefore stays bit-identical.
+pub fn search_placement_in(l: &Layout, item: &Item, ref_pk: Option<PItemKey>, mut evaluator: impl SampleEvaluator, sample_config: SampleConfig, rng: &mut impl Rng, sample_bbox: Option<jagua_rs::geometry::primitives::Rect>) -> (Option<(DTransformation, SampleEval)>, usize) {
     let item_min_dim = f32::min(item.shape_cd.bbox.width(), item.shape_cd.bbox.height());
 
     let mut best_samples = BestSamples::new(sample_config.n_coord_descents, item_min_dim * UNIQUE_SAMPLE_THRESHOLD);
@@ -38,7 +58,11 @@ pub fn search_placement(l: &Layout, item: &Item, ref_pk: Option<PItemKey>, mut e
         }
         None => None,
     };
-    let container_sampler = UniformBBoxSampler::new(l.container.outer_cd.bbox, item, l.container.outer_cd.bbox);
+    let container_sampler = UniformBBoxSampler::new(
+        sample_bbox.unwrap_or(l.container.outer_cd.bbox),
+        item,
+        l.container.outer_cd.bbox,
+    );
 
     //Perform the focussed sampling
     if let Some(focussed_sampler) = focussed_sampler {

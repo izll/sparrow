@@ -67,7 +67,12 @@ fn main() -> Result<()>{
     // Multi-sheet ("walled") strip mode, if requested
     let sheet = args.sheet_width.map(|width| {
         let gap = SheetConfig::resolve_gap(args.sheet_gap, config.min_item_separation);
-        SheetConfig { width, gap, compact_sheets: args.compact_sheets }
+        let mut sc = SheetConfig::new(width, gap, args.compact_sheets);
+        sc.pack_down = args.pack_down_sheets;
+        if args.plain_first {
+            sc.pipeline = SheetPipeline::PlainFirst;
+        }
+        sc
     });
     config.apply_sheet(sheet);
     if let Some(sheet) = sheet {

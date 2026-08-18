@@ -465,9 +465,41 @@ Measured against the BPP references (30 s + 20 s, seed 42):
 * **112 parts**: walled = 4 sheets at 73.9 / 71.5 / 87.4 / 50.4 %, versus bpp's 4 bins at
   41.9 / 72.5 / 83.8 / 84.7 %. Same bin count, but the walled run concentrates *all* the slack into a
   single 839 mm reusable band instead of spreading it — clearly better for reuse.
-* **iso6**: walled = 9 sheets, equal to the bpp result and to the proven lower bound of 9.
+* **iso6**: walled = 9 sheets, equal to the bpp result.
 * **iso7**: walled = 3 sheets, *worse* than the 2 sheets a cut free strip would give. The walls trap
   the search in a 3-sheet arrangement because there is no cross-sheet relocation move. Diagnosed in
   `docs/sheets.md`; a `pack_down`-style operator is the natural fix.
 
 The BPP pipeline itself is untouched by phase 7. See [`docs/sheets.md`](sheets.md).
+
+## Status note: phase 8 — the BPP's operators ported to the walled strip mode
+
+Phase 8 ported the BPP's two cross-bin operators into the walled SPP mode, since phase 7's diagnosis
+was precisely that the walled strip lacked them:
+
+| BPP operator | Walled-strip counterpart | Where |
+| --- | --- | --- |
+| `BPSeparator::close_bin_and_scatter` + `separate()` | `sheets::try_drop_sheet` — cut the strip by a whole sheet and scatter the last sheet's items over the survivors | `src/optimizer/sheets.rs` |
+| `compress::pack_down` (item transfer + short separate + rollback) | `sheets::pack_down_sheets` — cut the last sheet's *band* back and relocate what no longer fits | `src/optimizer/sheets.rs` |
+| `BPExplorationConfig::max_reduction_density` (area bound) | `SheetConfig::max_reduction_density`, `sheets::required_density_for` | `src/config.rs` |
+| strikes / infeasible pool / disruption around the reduction attempt | the same, in `explore::attempt_sheet_drop` | `src/optimizer/explore.rs` |
+
+**The port works but does not transfer the BPP's results**, and the reason is structural and worth
+recording for anyone reaching for these operators again:
+
+* **The BPP's bins are separate `Layout`s; the walled strip is one layout.** In the BPP, an item
+  moved into another bin *cannot* wander back — the separator of that bin has no access to the
+  source. In the walled strip the separator's placement search is global over the whole strip, so it
+  puts a transferred item straight back into the empty space it came from. Every single-item
+  transfer measured on iso7 was undone within a fraction of a second. The fix — bundling the
+  transfer with a width cut that *removes* the vacated space — is why `pack_down_sheets` looks
+  nothing like `pack_down` in the end.
+* **`exploration_phase` (SPP) trusts its starting solution; `exploration_phase` (BPP) asserts on
+  it.** The BPP version has `debug_assert!(sep.total_loss() == 0.0)` at the top; the SPP version
+  seeds `feasible_sols` with whatever it is handed, untested. Any SPP operator that hands the phase
+  a new starting layout must therefore verify feasibility itself — phase 8 hit this twice and both
+  times it produced a *better-looking but infeasible* result (see `docs/sheets.md`).
+
+Measured outcome on the four reference instances: sheet counts unchanged (3 / 9 / 4 / 2), one
+instance (swim) improved on density and reusable band, iso7 still 3 sheets. Full numbers, and why
+iso7 resists all three operators, in [`docs/sheets.md`](sheets.md).

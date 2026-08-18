@@ -21,19 +21,94 @@ pub struct SheetConfig {
     /// the wall a well-covered pole surrogate and therefore a smooth GLS loss gradient.
     /// See [`SheetConfig::resolve_gap`].
     pub gap: f32,
-    /// **Post-pass hook (phase 8, not yet implemented).** When enabled, after the compression phase
-    /// every sheet except the last one would be re-compacted to the left *within its own sheet*, so
-    /// the leftover of each sheet becomes one wide, reusable right-hand band instead of many small
-    /// gaps between the parts.
+    /// **Per-sheet left-compaction post-pass.** When enabled, after the compression phase every
+    /// sheet except the last one is re-compacted to the left *within its own sheet*, so the leftover
+    /// of each sheet becomes one wide, reusable right-hand band instead of many small gaps between
+    /// the parts.
     ///
     /// This is a purely *secondary* objective: it cannot reduce the sheet count (that is already
-    /// minimised by the walled strip width), it only redistributes the slack inside a sheet. The
-    /// intended implementation mirrors the BPP `consolidate_layout`: build an SPP sub-problem from
-    /// one sheet's items with the strip height fixed, run the separator on it for a share of a small
-    /// budget, translate the result back, and accept only if the whole layout stays feasible and no
-    /// item crosses a wall. Currently ignored; see `docs/sheets.md`.
+    /// minimised by the walled strip width) nor the strip width, it only redistributes the slack
+    /// inside a sheet. See [`crate::optimizer::sheets::compact_sheets_left`].
     pub compact_sheets: bool,
+
+    /// **Sheet-drop move** (phase 8). How many *failed* drop attempts are tolerated before the
+    /// exploration phase gives up on dropping sheets and spends the rest of its budget on the plain
+    /// fine shrink (which is what minimises the last sheet's band).
+    ///
+    /// Each strike is one full "relocate the last sheet's items into the earlier sheets and try to
+    /// separate" attempt. See [`crate::optimizer::sheets::try_drop_sheet`].
+    pub sheet_drop_strikes: usize,
+
+    /// **Area bound** on the sheet-drop move, mirroring the BPP's
+    /// [`BPExplorationConfig::max_reduction_density`]: if the total item area divided by the area
+    /// of `n - 1` sheets exceeds this, dropping a sheet would require a nesting density that is out
+    /// of reach in practice, and no attempt is made at all.
+    pub max_reduction_density: f32,
+
+    /// Whether the compression phase runs the **cross-sheet pack-down**: cut the last sheet's band
+    /// back in large steps, relocating whatever no longer fits into the earlier sheets and making
+    /// room with a short `separate()`. See [`crate::optimizer::sheets::pack_down_sheets`].
+    ///
+    /// **Defaults to `false`.** The step is correct and does what it says, but on all four measured
+    /// instances (iso6, iso7, madisocad_iso, swim) not a single band cut was ever accepted, while
+    /// the failed attempts cost 2–10 s of a 20 s compression budget — on madisocad_iso enough to
+    /// leave the final band ~56 mm worse than without it. Since it is the fine compression that
+    /// actually shortens the band on these instances, the step is opt-in rather than on by default;
+    /// the sheet-drop move in the exploration phase is the operator that pays off.
+    pub pack_down: bool,
+
+    /// Wall-clock budget for a single pack-down band cut.
+    pub pack_down_move_time_limit: Duration,
+
+    /// Fraction of the compression phase's budget the pack-down step may use at most; the rest is
+    /// left to the fine compression that shortens the last band.
+    ///
+    /// Deliberately a minority share: the pack-down either finds a cut in its first attempt or two,
+    /// or there is none to find, and on an instance where there is none every second it spends is a
+    /// second the fine compression does not get.
+    pub pack_down_time_ratio: f32,
+
+    /// How the walled run is *started*. See [`SheetPipeline`].
+    pub pipeline: SheetPipeline,
+
+    /// Fraction of the exploration budget the [`SheetPipeline::PlainFirst`] pipeline spends on its
+    /// wall-less pre-pass. The remainder goes to the walled exploration that follows.
+    pub plain_first_ratio: f32,
 }
+
+/// How a walled (`--sheet-width`) run gets its starting layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SheetPipeline {
+    /// **Walls from the start** (default): the starting layout is built with the walls already in
+    /// place (LBF respects them) and the exploration works with them from its first iteration.
+    ///
+    /// This is the phase-7 behaviour, and it remains the default because
+    /// [`SheetPipeline::PlainFirst`] was measured **not to beat it** on any of the four reference
+    /// instances once the wall-installation repair is required to actually produce a feasible
+    /// layout (see `docs/sheets.md`).
+    #[default]
+    WalledFromStart,
+    /// **Plain strip first, walls after.** The exploration phase is run *without* walls for
+    /// `plain_first_ratio` of its budget, which lets the strip engine do what it is best at — it
+    /// reaches a far higher density when it is not fighting the walls (iso7: 83.1 % vs 61.5 %). The
+    /// resulting layout is then cut into sheets: the strip is chopped into chunks of `W - slack`,
+    /// every item is translated right onto its own sheet (so the *whole chunk* moves together and
+    /// its internal neighbour relationships survive), the walls are installed, and the separator
+    /// repairs the items that were straddling a chunk boundary.
+    ///
+    /// The repair is **verified**: if it does not reach zero loss, the cut is retried with more
+    /// slack per sheet, and if that still fails the run falls back to a walled LBF start. Handing an
+    /// unrepaired layout to the exploration phase is not an option — that phase trusts its starting
+    /// solution without testing it and would report the wall-straddling start as the final answer.
+    PlainFirst,
+}
+
+/// Default for [`SheetConfig::sheet_drop_strikes`].
+pub const DEFAULT_SHEET_DROP_STRIKES: usize = 3;
+
+/// Default for [`SheetConfig::max_reduction_density`]; same value (and same reasoning) as the BPP's
+/// [`BPExplorationConfig::max_reduction_density`].
+pub const DEFAULT_SHEET_MAX_REDUCTION_DENSITY: f32 = 0.90;
 
 /// Default wall thickness when `--sheet-gap` is not given: at least [`MIN_DEFAULT_SHEET_GAP`] mm,
 /// and never less than twice the minimum item separation (so the wall stays thicker than the
@@ -41,6 +116,23 @@ pub struct SheetConfig {
 pub const MIN_DEFAULT_SHEET_GAP: f32 = 20.0;
 
 impl SheetConfig {
+    /// A sheet configuration with the default phase-8 settings (sheet-drop enabled with
+    /// [`DEFAULT_SHEET_DROP_STRIKES`] strikes, pack-down enabled).
+    pub fn new(width: f32, gap: f32, compact_sheets: bool) -> Self {
+        Self {
+            width,
+            gap,
+            compact_sheets,
+            sheet_drop_strikes: DEFAULT_SHEET_DROP_STRIKES,
+            max_reduction_density: DEFAULT_SHEET_MAX_REDUCTION_DENSITY,
+            pack_down: false,
+            pack_down_move_time_limit: Duration::from_secs(2),
+            pack_down_time_ratio: 0.3,
+            pipeline: SheetPipeline::WalledFromStart,
+            plain_first_ratio: 0.5,
+        }
+    }
+
     /// Distance between the left edges of two consecutive sheets: `width + gap`.
     pub fn pitch(&self) -> f32 {
         self.width + self.gap

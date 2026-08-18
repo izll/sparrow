@@ -5,10 +5,10 @@ use crate::optimizer::explore::exploration_phase;
 use crate::optimizer::lbf::LBFBuilder;
 use crate::optimizer::separator::Separator;
 use crate::util::listener::{ReportType, SolutionListener};
-use crate::optimizer::sheets::{apply_sheet_walls_opt, log_sheet_report, widen_for_walls};
-use crate::util::terminator::Terminator;
+use crate::optimizer::sheets::{apply_sheet_walls_opt, install_walls_into_plain, log_sheet_report, n_sheets, rollback_to_width, widen_for_walls};
+use crate::util::terminator::{BasicTerminator, Terminator};
 use jagua_rs::probs::spp::entities::{SPInstance, SPSolution};
-use log::info;
+use log::{info, warn};
 use rand::{Rng, SeedableRng};
 use std::time::Duration;
 use rand::rngs::Xoshiro256PlusPlus;
@@ -32,15 +32,22 @@ pub fn optimize(
     initial_solution: Option<&SPSolution>
 ) -> SPSolution {
     let mut next_rng = || Xoshiro256PlusPlus::seed_from_u64(rng.next_u64());
+    let total_elapsed = jagua_rs::Instant::now();
     
-    // First build an initial solution if none is provided
+    // Whether the walled run starts from a wall-less pre-pass instead of a walled LBF.
+    let plain_first = matches!(expl_config.sheet, Some(sheet) if sheet.pipeline == SheetPipeline::PlainFirst)
+        && initial_solution.is_none();
+
+    // First build an initial solution if none is provided. Skipped entirely under the plain-first
+    // pipeline, which builds its own (wall-less) start inside the pre-pass.
     let start_prob = match initial_solution {
-        None => {
+        None if plain_first => None,
+        None => Some({
             let builder = LBFBuilder::new_with_sheet(instance.clone(), next_rng(), LBF_SAMPLE_CONFIG, expl_config.sheet)
                 .construct();
             builder.prob
-        }
-        Some(init_sol) => {
+        }),
+        Some(init_sol) => Some({
             info!("[OPT] warm starting from provided initial solution");
             let mut prob = jagua_rs::probs::spp::entities::SPProblem::new(instance.clone());
             apply_sheet_walls_opt(&mut prob, expl_config.sheet.as_ref());
@@ -55,12 +62,33 @@ pub fn optimize(
                 widen_for_walls(&mut prob, sheet);
             }
             prob
-        }
+        }),
     };
 
-    // Begin by executing the exploration phase
-    terminator.new_timeout(expl_config.time_limit);
-    let mut expl_separator = Separator::new_with_sheet(instance.clone(), start_prob, next_rng(), expl_config.separator_config, expl_config.sheet);
+    // --- Phase 8: the "plain strip first, walls after" pipeline -------------------------------
+    //
+    // A walled exploration fights the walls from its first iteration and reaches a far lower
+    // density than the plain strip engine does with the same budget (iso7: 61.5 % vs 83.2 %). This
+    // pipeline gives the plain engine the first `plain_first_ratio` of the exploration budget with
+    // the walls switched *off*, then installs the walls into the result (see
+    // `sheets::install_walls_into_plain`) and lets the separator repair the few items that end up
+    // on a wall — a local repair instead of a global re-nest. Only then does the walled exploration
+    // (fine shrink + sheet-drop) take over for the rest of the budget.
+    //
+    // Only reachable when a sheet config is present, so plain strip packing is untouched.
+    let mut expl_separator = match (plain_first, start_prob) {
+        (true, _) => {
+            let sheet = expl_config.sheet.expect("plain_first implies a sheet config");
+            let plain_budget = expl_config.time_limit.mul_f32(sheet.plain_first_ratio.clamp(0.0, 1.0));
+            plain_first_prepass(&instance, &mut next_rng, sol_listener, terminator, expl_config, sheet, plain_budget)
+        }
+        (false, Some(start_prob)) =>
+            Separator::new_with_sheet(instance.clone(), start_prob, next_rng(), expl_config.separator_config, expl_config.sheet),
+        (false, None) => unreachable!("a non plain-first run always builds a starting problem"),
+    };
+
+    // Begin by executing the (walled) exploration phase with whatever budget is left
+    terminator.new_timeout(expl_config.time_limit.saturating_sub(total_elapsed.elapsed()));
     let solutions = exploration_phase(
         &instance,
         &mut expl_separator,
@@ -94,3 +122,137 @@ pub fn optimize(
     // Return the final compressed solution
     cmpr_sol
 }
+
+/// The wall-less pre-pass of [`SheetPipeline::PlainFirst`].
+///
+/// Runs LBF + [`exploration_phase`] with **no** sheet configuration at all for `plain_budget`, so
+/// the strip engine works at full strength, then installs the walls into the best solution it found
+/// ([`install_walls_into_plain`]) and hands back a walled separator for the main exploration phase.
+///
+/// The wall installation itself is not verified here: the layout it produces is expected to be
+/// infeasible (the items that straddled a boundary now overlap a wall), and repairing it is exactly
+/// what the walled `exploration_phase` does on its first `separate()` call. Should that repair
+/// fail, the phase behaves as it always does — it never reports an infeasible solution as feasible,
+/// it simply pools it and disrupts — and the width it starts from already has a whole sheet's worth
+/// of slack in the last sheet, which is the same safety margin `widen_for_walls` provides for a
+/// warm start.
+fn plain_first_prepass(
+    instance: &SPInstance,
+    next_rng: &mut impl FnMut() -> Xoshiro256PlusPlus,
+    sol_listener: &mut impl SolutionListener,
+    terminator: &mut impl Terminator,
+    expl_config: &ExplorationConfig,
+    sheet: SheetConfig,
+    plain_budget: Duration,
+) -> Separator {
+    info!("[OPT] [SHEET] plain-first pipeline: exploring for {:.0}s WITHOUT walls, then installing them",
+        plain_budget.as_secs_f32());
+
+    // 1. A wall-less exploration, with the sheet config stripped from every level.
+    let plain_expl_config = ExplorationConfig { sheet: None, time_limit: plain_budget, ..*expl_config };
+    let builder = LBFBuilder::new(instance.clone(), next_rng(), LBF_SAMPLE_CONFIG).construct();
+    let mut plain_sep = Separator::new(instance.clone(), builder.prob, next_rng(), plain_expl_config.separator_config);
+
+    terminator.new_timeout(plain_budget);
+    let plain_sols = exploration_phase(instance, &mut plain_sep, sol_listener, terminator, &plain_expl_config);
+    let plain_best = plain_sols.last().expect("the exploration phase always returns a solution").clone();
+    info!("[OPT] [SHEET] plain pre-pass finished: width {:.1} ({:.3}%) = {} sheet(s) of {}",
+        plain_best.strip_width(), plain_best.density(instance) * 100.0,
+        (plain_best.strip_width() / sheet.width).ceil().max(1.0) as usize, sheet.width);
+
+    // 2. Turn that separator into a walled one and install the walls into the best solution.
+    plain_sep.rollback(&plain_best, None);
+    let mut sep = Separator::new_with_sheet(
+        plain_sep.instance, plain_sep.prob, next_rng(), expl_config.separator_config, Some(sheet),
+    );
+    let plain_best_for_retry = plain_best.clone();
+    let n = install_walls_into_plain(&mut sep, &sheet, 0.0);
+    info!("[OPT] [SHEET] walls installed: {} sheet(s), strip width {:.1}", n, sep.prob.strip_width());
+    debug_assert_eq!(n_sheets(sep.prob.strip_width(), &sheet), n);
+
+    // 3. Repair the items that now overlap a wall, and *verify* the repair worked.
+    //
+    // This check is not optional. `exploration_phase` seeds its list of feasible solutions with
+    // whatever layout it is handed, without testing it — so if the repair fails and the phase never
+    // reaches feasibility on its own, it would report the unseparated, wall-straddling start as the
+    // answer. Measured on iso7: the plain pre-pass hands over a beautiful 83 % layout that needs
+    // 2 sheets, the repair cannot resolve it (min loss ~170), and the run would happily print
+    // "2 sheets" for a layout whose first sheet is 2088 mm wide on a 1995 mm sheet.
+    //
+    // The repair therefore gets a bounded budget of its own, and on failure the run falls back to
+    // one spare sheet's worth of slack — the same margin `widen_for_walls` gives a warm start —
+    // which the walled exploration then shrinks away as usual.
+    // The repair is a global job (every wall-crosser has to find a new home, and its neighbours have
+    // to make room), so it gets the same patient separator the scatter repair uses: with the
+    // exploration's default 3 strikes it gives up after ~3 s regardless of how much budget it has.
+    let outer_cfg = sep.config;
+    sep.config.strike_limit = outer_cfg.strike_limit.max(WALL_REPAIR_STRIKE_LIMIT);
+    sep.config.iter_no_imprv_limit = outer_cfg.iter_no_imprv_limit.max(WALL_REPAIR_ITER_NO_IMPRV_LIMIT);
+
+    // Try `n` sheets, then `n+1`, then `n+2`, ... until the repair actually reaches zero loss.
+    // Handing an *infeasible* layout to `exploration_phase` is not an option: the phase seeds its
+    // list of feasible solutions with whatever it is given, without testing it, so an unrepaired
+    // start is reported as the final answer. Measured on iso6, that produced a "7 sheet" result
+    // whose layout still had a total loss of 163 — i.e. overlapping parts. Every extra sheet adds a
+    // whole sheet's worth of slack, so this terminates quickly in practice (and the exploration
+    // shrinks the extra width straight back).
+    let mut n_sheets_used = n;
+    for attempt in 0..=WALL_REPAIR_MAX_EXTRA_SHEETS {
+        if attempt > 0 {
+            // Retry from the *plain* layout again, but cut into shorter chunks: every sheet then
+            // keeps `slack` mm free at its right edge for the wall-crossers to slide into. This is
+            // a genuinely different (easier) subproblem, unlike merely widening the strip, which
+            // leaves every sheet exactly as tight as it already was.
+            let slack = sheet.width * WALL_REPAIR_SLACK_STEP * attempt as f32;
+            rollback_to_width(&mut sep, &plain_best_for_retry);
+            n_sheets_used = install_walls_into_plain(&mut sep, &sheet, slack);
+            info!("[OPT] [SHEET] retrying the wall repair with {:.0} mm slack per sheet -> {} sheet(s) (width {:.1})",
+                slack, n_sheets_used, sep.prob.strip_width());
+        }
+        // Every retry gets an equal share of one bounded repair budget, so a run whose repair never
+        // succeeds cannot eat the walled exploration's half of the time.
+        let mut repair_term = BasicTerminator::new();
+        repair_term.new_timeout(
+            plain_budget.mul_f32(WALL_REPAIR_BUDGET_RATIO)
+                .div_f32((WALL_REPAIR_MAX_EXTRA_SHEETS + 1) as f32),
+        );
+        let (repaired, ct) = sep.separate(&repair_term, sol_listener);
+        if ct.get_total_loss() == 0.0 {
+            sep.rollback(&repaired, Some(&ct));
+            sep.config = outer_cfg;
+            info!("[OPT] [SHEET] wall repair succeeded: {} sheet(s) at {:.3}%, layout feasible and \
+                   all items clear of the walls", n_sheets_used, sep.prob.density() * 100.0);
+            return sep;
+        }
+        sep.rollback(&repaired, Some(&ct));
+        warn!("[OPT] [SHEET] wall repair at {} sheet(s) failed (min loss {})",
+            n_sheets_used, crate::FMT().fmt2(ct.get_total_loss()));
+    }
+
+    // Still nothing: fall back to a walled LBF, which is feasible by construction. The plain
+    // pre-pass's work is lost, but a correct answer from a worse start beats an infeasible one.
+    sep.config = outer_cfg;
+    warn!("[OPT] [SHEET] wall repair gave up after {} extra sheet(s); falling back to a walled LBF start",
+        WALL_REPAIR_MAX_EXTRA_SHEETS);
+    let builder = LBFBuilder::new_with_sheet(instance.clone(), next_rng(), LBF_SAMPLE_CONFIG, Some(sheet)).construct();
+    Separator::new_with_sheet(builder.instance, builder.prob, next_rng(), expl_config.separator_config, Some(sheet))
+}
+
+/// How many extra sheets the wall-installation repair may ask for before giving up on the plain
+/// pre-pass's layout altogether. Each one is a whole sheet's worth of extra slack, so a repair that
+/// needs more than a couple is not going to be worth keeping anyway.
+const WALL_REPAIR_MAX_EXTRA_SHEETS: usize = 3;
+
+/// How much slack (as a fraction of the sheet width) each retry of the wall repair leaves free at
+/// the right edge of every sheet. Retry `i` uses `i * WALL_REPAIR_SLACK_STEP * W`.
+const WALL_REPAIR_SLACK_STEP: f32 = 0.10;
+
+/// Share of the plain pre-pass's budget granted to the wall-installation repair. Bounded so a
+/// hopeless repair cannot eat the walled exploration's time; the fallback below it is cheap.
+const WALL_REPAIR_BUDGET_RATIO: f32 = 0.5;
+
+/// Strike limit for the wall-installation repair; see the use site.
+const WALL_REPAIR_STRIKE_LIMIT: usize = 8;
+
+/// No-improvement iteration limit for the wall-installation repair; see the use site.
+const WALL_REPAIR_ITER_NO_IMPRV_LIMIT: usize = 400;

@@ -53,12 +53,27 @@ pub struct MainCli {
                 Defaults to max(20, 2 * min-sep)")]
     pub sheet_gap: Option<f32>,
 
-    /// Compact each sheet's items to the left within their own sheet after compression (phase 8, not yet implemented)
+    /// Compact each sheet's items to the left within their own sheet after compression
     #[arg(long = "compact-sheets", requires = "sheet_width",
         help = "After compression, re-compact every sheet except the last one within its own sheet, so the leftover of each \
                 sheet becomes one wide reusable band instead of many small gaps. Secondary objective only: it cannot reduce \
-                the sheet count. NOT YET IMPLEMENTED (accepted and reported, but currently a no-op)")]
+                the sheet count or the strip width")]
     pub compact_sheets: bool,
+
+    /// Start the walled run from a wall-less pre-pass instead of exploring with the walls in place
+    #[arg(long = "plain-first", requires = "sheet_width",
+        help = "Run the exploration WITHOUT walls for half its budget first (the strip engine reaches a much higher \
+                density that way), then cut the result into sheets, install the walls and repair the items that end up \
+                on one. Falls back to a walled start if the repair cannot be made feasible. Off by default: measured \
+                not to beat the walled-from-start pipeline on any reference instance")]
+    pub plain_first: bool,
+
+    /// Run the cross-sheet pack-down in the compression phase (off by default)
+    #[arg(long = "pack-down-sheets", requires = "sheet_width",
+        help = "Before the fine compression, cut the last sheet's leftover band back in large steps and relocate \
+                whatever no longer fits into the earlier sheets. Off by default: on the measured instances no cut \
+                was ever accepted and the attempts cost the fine compression its budget")]
+    pub pack_down_sheets: bool,
 
     /// Number of independent optimizations to run in parallel (different seeds), keeping the best final solution
     #[arg(short = 'p', long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..),

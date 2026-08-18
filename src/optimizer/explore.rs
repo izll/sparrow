@@ -1,5 +1,6 @@
-use crate::config::ExplorationConfig;
+use crate::config::{ExplorationConfig, SheetConfig};
 use crate::optimizer::separator::{Separator, SeparatorConfig};
+use crate::optimizer::sheets::{n_sheets, required_density_for, rollback_to_width, try_drop_sheet};
 use crate::sample::uniform_sampler::convert_sample_to_closest_feasible;
 use crate::util::listener::{ReportType, SolutionListener};
 use crate::util::terminator::Terminator;
@@ -22,12 +23,32 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
     let mut current_width = sep.prob.strip_width();
     let mut best_width = current_width;
 
+    // The exploration phase assumes it starts from a feasible (collision-free) layout: it is recorded as the first
+    // feasible solution without being separated. Callers that build the start themselves (warm starts, sheet-wall
+    // installation) must guarantee this; in debug builds we verify it.
+    debug_assert!(sep.ct.get_total_loss() == 0.0, "[EXPL] exploration must start from a feasible layout (loss: {})", sep.ct.get_total_loss());
     let mut feasible_sols = vec![sep.prob.save()];
 
     sol_listener.report(ReportType::ExplFeas, &feasible_sols[0], instance);
     info!("[EXPL] starting optimization with initial width: {:.3} ({:.3}%)",current_width,sep.prob.density() * 100.0);
 
     let mut infeas_sol_pool: Vec<(SPSolution, f32)> = vec![];
+
+    // --- Phase 8: sheet-drop bookkeeping (walled mode only) -----------------------------------
+    // How many drop attempts have failed *at the current sheet count*. Once it reaches
+    // `sheet_drop_strikes` the phase stops attempting drops and spends the rest of its budget on
+    // the plain fine shrink, which is what minimises the last sheet's band. A successful drop (or
+    // any change of the sheet count) resets it: a new sheet count is a genuinely new subproblem.
+    let mut drop_strikes = 0usize;
+    // The sheet count the strikes above were collected at.
+    let mut drop_strikes_at: Option<usize> = None;
+    // The tightest feasible solution seen so far: what a drop attempt starts from and rolls back to.
+    let mut last_feasible: Option<SPSolution> = Some(feasible_sols[0].clone());
+    // Consecutive failures of the *fine* shrink since the last feasible solution. The drop is only
+    // attempted once this reaches `SHEET_DROP_AFTER_SHRINK_FAILURES`; see there.
+    let mut shrink_failures = 0usize;
+    // Fallback rounds since the strike budget ran out; refills it, see the use site.
+    let mut drop_cooldown = 0usize;
 
     while !term.kill() {
         // Attempt to separate the current layout
@@ -42,6 +63,13 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
                 feasible_sols.push(local_best.0.clone());
                 sol_listener.report(ReportType::ExplFeas, &local_best.0, instance);
             }
+
+            // Phase 8: this is the tightest feasible layout seen so far, so it is the solution a
+            // sheet-drop attempt must start from and roll back to. The attempt itself is *not* made
+            // here — see the infeasible branch below for why.
+            last_feasible = Some(local_best.0.clone());
+            shrink_failures = 0;
+
             // Shrink the strip width and clear the infeasible solution pool
             let next_width = current_width * (1.0 - config.shrink_step);
             info!("[EXPL] shrinking strip by {}%: {:.3} -> {:.3}", config.shrink_step * 100.0, current_width, next_width);
@@ -62,6 +90,77 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
                 break;
             }
 
+            // --- Phase 8: the sheet-drop move ---------------------------------------------
+            //
+            // The drop is attempted **here**, from the last feasible solution, once the fine
+            // shrink has failed `SHEET_DROP_AFTER_SHRINK_FAILURES` times in a row — and not in
+            // the feasible branch above. The reason is measured: a drop from a *loose* n-sheet
+            // layout has to relocate the whole content of a nearly-full last sheet at once and
+            // essentially never succeeds, whereas after the fine shrink has stalled the last
+            // sheet holds as little as it ever will, which is the smallest possible relocation
+            // and the only one with a real chance. Waiting also stops the (expensive) attempts
+            // from eating the budget the fine shrink needs to get there.
+            //
+            // Policy (deterministic, documented in `docs/sheets.md`):
+            //   * at most `sheet_drop_strikes` failed attempts per sheet count; afterwards the
+            //     phase falls back to the fine shrink alone for the rest of its budget at that
+            //     sheet count, so the last band still gets minimised;
+            //   * consecutive attempts differ in the RNG state (a different random scatter),
+            //     which is what makes a retry worth anything;
+            //   * the area bound skips the attempt outright when `n-1` sheets could not hold the
+            //     items even at `max_reduction_density`.
+            shrink_failures += 1;
+            if let Some(sheet) = config.sheet.as_ref()
+                && shrink_failures >= SHEET_DROP_AFTER_SHRINK_FAILURES
+                && let Some(feasible_sol) = last_feasible.clone()
+            {
+                shrink_failures = 0;
+                let n_now = n_sheets(feasible_sol.strip_width(), sheet);
+                if drop_strikes_at != Some(n_now) {
+                    // Sheet count changed since the strikes were collected: fresh budget.
+                    drop_strikes = 0;
+                    drop_strikes_at = Some(n_now);
+                }
+                if drop_strikes >= sheet.sheet_drop_strikes {
+                    // The strike budget is spent, so the phase has fallen back to the fine shrink
+                    // for a while — but arriving *here* means that shrink has failed again, i.e. it
+                    // is stuck too. Spending the rest of the budget repeating a move that provably
+                    // cannot progress is worse than trying the drop once more from a disrupted
+                    // layout, so the strikes are refilled after `SHEET_DROP_COOLDOWN` fallback
+                    // rounds. The counter is what keeps the drops from crowding the shrink out.
+                    drop_cooldown += 1;
+                    if drop_cooldown >= SHEET_DROP_COOLDOWN {
+                        debug!("[EXPL] [SHEET] refilling the sheet-drop strike budget: the fine \
+                                shrink is stuck as well");
+                        drop_strikes = 0;
+                        drop_cooldown = 0;
+                    }
+                }
+                // The attempt starts from the last feasible solution, not from the current
+                // (infeasible) one.
+                rollback_to_width(sep, &feasible_sol);
+                if let Some(dropped_width) = attempt_sheet_drop(
+                    instance, sep, sheet, &feasible_sol, &mut drop_strikes,
+                    &mut infeas_sol_pool, sol_listener, term,
+                ) {
+                    // Success: the separator holds a feasible solution one sheet narrower. Record
+                    // it and let the loop resume the fine shrink on the *new* last sheet.
+                    best_width = dropped_width;
+                    current_width = dropped_width;
+                    let sol = sep.prob.save();
+                    last_feasible = Some(sol.clone());
+                    feasible_sols.push(sol.clone());
+                    sol_listener.report(ReportType::ExplFeas, &sol, instance);
+                    drop_strikes = 0;
+                    drop_strikes_at = Some(n_sheets(current_width, sheet));
+                    infeas_sol_pool.clear();
+                    continue;
+                }
+                // Failed: `attempt_sheet_drop` restored `feasible_sol` at its original width, and
+                // the pool rollback below re-establishes the width again, so nothing more is
+                // needed here — the phase simply carries on with the normal disruption.
+            }
+
             // Restore to a random solution from the pool, with better solutions having more chance to be selected
             let selected_sol = {
                 // Sample a value in range [0.0, 1.0[ from a normal distribution
@@ -76,7 +175,13 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             };
 
             // Rollback to this solution and disrupt it.
-            sep.rollback(selected_sol, None);
+            //
+            // In the walled mode the pool may also hold the (narrower) result of a failed
+            // sheet-drop attempt, so the rollback has to be width-aware; `rollback_to_width` is a
+            // plain `Separator::rollback` whenever the widths already match, which is always the
+            // case in plain strip-packing mode.
+            rollback_to_width(sep, selected_sol);
+            current_width = sep.prob.strip_width();
             disrupt_solution(sep, config);
         }
     }
@@ -84,6 +189,90 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
     info!("[EXPL] finished, best feasible solution: width: {:.3} ({:.3}%)",best_width,feasible_sols.last().unwrap().density(instance) * 100.0);
 
     feasible_sols
+}
+
+/// After how many consecutive failures of the *fine* (0.1 %) shrink a sheet-drop is attempted.
+///
+/// The value is small on purpose: a couple of failures already mean the fine shrink has run out of
+/// easy room at the current sheet count, which is exactly the state a drop wants to start from (the
+/// last sheet holds as little as it is going to). Making it larger only delays the attempt into a
+/// part of the budget where a failure can no longer be recovered from.
+const SHEET_DROP_AFTER_SHRINK_FAILURES: usize = 2;
+
+/// How many fallback rounds (fine shrink attempts that also failed) refill the sheet-drop strike
+/// budget. Keeps a long budget from being spent entirely on a fine shrink that has demonstrably
+/// stopped making progress, while still leaving the shrink the majority of the iterations.
+const SHEET_DROP_COOLDOWN: usize = 6;
+
+/// One **sheet-drop attempt** (phase 8), driven by the exploration phase from a feasible solution.
+///
+/// Returns `Some(new_width)` when the solution now fits into one sheet fewer (the separator is left
+/// holding that feasible, narrower solution), and `None` otherwise — in which case `feasible_sol`
+/// has been restored at its original width, so the caller can carry on with the fine shrink as if
+/// nothing had happened.
+///
+/// The attempt is skipped (returning `None` immediately, without consuming a strike) when
+/// * there is only one sheet — nothing to drop;
+/// * the strike budget for this sheet count is exhausted;
+/// * the **area bound** says `n-1` sheets could not hold the items even at
+///   [`SheetConfig::max_reduction_density`].
+///
+/// A failed attempt costs one strike, and its (infeasible) result is added to the caller's pool
+/// exactly like a failed fine shrink — the pool is what the disruption logic samples from.
+#[allow(clippy::too_many_arguments)]
+fn attempt_sheet_drop(
+    instance: &SPInstance,
+    sep: &mut Separator,
+    sheet: &SheetConfig,
+    feasible_sol: &SPSolution,
+    drop_strikes: &mut usize,
+    infeas_sol_pool: &mut Vec<(SPSolution, f32)>,
+    sol_listener: &mut impl SolutionListener,
+    term: &impl Terminator,
+) -> Option<f32> {
+    let width = sep.prob.strip_width();
+    let n = n_sheets(width, sheet);
+    if n < 2 {
+        return None;
+    }
+    if *drop_strikes >= sheet.sheet_drop_strikes {
+        return None;
+    }
+    // Area bound: can `n-1` sheets hold all the items at a density that is reachable at all?
+    let required = required_density_for(sep, n - 1, sheet);
+    if required > sheet.max_reduction_density {
+        debug!("[EXPL] sheet drop to {} sheet(s) would need {:.1}% density > cap {:.1}%, skipping",
+            n - 1, required * 100.0, sheet.max_reduction_density * 100.0);
+        return None;
+    }
+
+    let (succeeded, attempt, loss) = try_drop_sheet(sep, sheet, term, sol_listener);
+    if succeeded {
+        let new_width = sep.prob.strip_width();
+        // Leave the separator holding the *feasible* result of the attempt.
+        sep.rollback(&attempt, None);
+        info!("[EXPL] [SHEET] sheet drop succeeded: {} -> {} sheet(s) (width {:.3} -> {:.3}, dens {:.3}%)",
+            n, n_sheets(new_width, sheet), width, new_width, sep.prob.density() * 100.0);
+        return Some(new_width);
+    }
+
+    *drop_strikes += 1;
+    info!("[EXPL] [SHEET] sheet drop to {} sheet(s) failed (min loss: {}), strike {}/{}",
+        n - 1, FMT().fmt2(loss), drop_strikes, sheet.sheet_drop_strikes);
+    sol_listener.report(ReportType::ExplInfeas, &attempt, instance);
+
+    // Keep the failed attempt in the pool, like any other infeasible result. It is at a *different*
+    // (narrower) width than the pool's other entries, which the pool itself does not care about —
+    // but the caller's rollback does, so `rollback_to_width` is used there. Pooling it is still
+    // worthwhile: the pool is only consulted when the *fine* shrink fails, and at that point a
+    // narrow-but-nearly-separated layout is a legitimate (if aggressive) restart point.
+    match infeas_sol_pool.binary_search_by(|(_, o)| o.partial_cmp(&loss).unwrap()) {
+        Ok(idx) | Err(idx) => infeas_sol_pool.insert(idx, (attempt, loss)),
+    }
+
+    // Roll back to the feasible solution at its original width and let the fine shrink resume.
+    rollback_to_width(sep, feasible_sol);
+    None
 }
 
 fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) {

@@ -54,7 +54,8 @@ use jagua_rs::geometry::primitives::{Rect, SPolygon};
 use jagua_rs::geometry::shape_modification::ShapeModifyMode;
 use jagua_rs::geometry::{DTransformation, OriginalShape};
 use jagua_rs::probs::spp::entities::{SPInstance, SPProblem, SPSolution};
-use log::info;
+use jagua_rs::Instant;
+use log::{debug, info, warn};
 
 /// Vertical margin by which a wall extends past the strip's height, so that it always cuts the
 /// container cleanly from top to bottom (rather than leaving a hairline gap at the border).
@@ -306,4 +307,582 @@ pub fn log_sheet_report(phase: &str, sol: &SPSolution, instance: &SPInstance, sh
         gap_area,
         gap_area / total_area * 100.0,
     );
+}
+
+// =================================================================================================
+// Phase 8: cross-sheet relocation
+// =================================================================================================
+//
+// # Why a dedicated move is needed
+//
+// The exploration phase's only move on the *objective* is the 0.1 % fine shrink. In the walled
+// mode that shrink narrows the strip's right-hand end, so the pressure it applies is felt **only by
+// the last sheet's boundary**: sheets `0..n-2` are separated from the shrinking end by the walls
+// and never feel any compaction at all. Their holes are filled only by lucky random samples of the
+// separator, which is not a systematic mechanism.
+//
+// Measured consequence (phase 7, iso7, 33 parts, `--sheet-width 1995 --min-sep 5`): the free strip
+// reaches 83.2 % (3466 mm = 1.74 sheets), but the walled run jams at 3 sheets with used widths
+// 1990 / 1990 / 686 — the first two sheets sit at ~63 % density while the third holds 686 mm of
+// parts that would fit into their holes if room were made for them.
+//
+// Phase 8 adds the missing operator, in the two places where it can pay off:
+//
+// * [`try_drop_sheet`] — the **sheet-drop / scatter** move for the exploration phase. It is the
+//   direct SPP analogue of the BPP's `close_bin_and_scatter` + `separate()`: shrink the strip by a
+//   *whole sheet* at once and relocate the dropped sheet's items to random positions over the
+//   surviving sheets, then let the separator resolve the overlap that creates. Where the fine
+//   shrink is a local move that can never make a part jump a wall, this one does exactly that.
+// * [`pack_down_sheets`] — the **cross-sheet pack-down** for the compression phase: the same idea
+//   at single-item granularity, used once the sheet count is fixed.
+
+use crate::optimizer::separator::Separator;
+use crate::sample::search::search_placement_in;
+use crate::sample::uniform_sampler::UniformBBoxSampler;
+use crate::eval::sep_evaluator::SeparationEvaluator;
+use crate::quantify::tracker::CollisionTracker;
+use crate::util::assertions::tracker_matches_layout;
+use crate::util::listener::{ReportType, SolutionListener};
+use crate::util::terminator::{BasicTerminator, Terminator};
+use itertools::Itertools;
+use jagua_rs::entities::PItemKey;
+use rand::{Rng, RngExt, SeedableRng};
+use rand::rngs::Xoshiro256PlusPlus;
+use ordered_float::OrderedFloat;
+use std::cmp::Reverse;
+use std::time::Duration;
+
+/// The strip width that holds exactly `n` sheets: `(n-1) * (W + gap) + W`.
+///
+/// This is the *tightest* width for `n` sheets — one full sheet less than `n+1` sheets need, and
+/// with no unused tail. Shrinking the strip to `target_width_for(n-1)` is exactly the sheet-drop
+/// move's objective step.
+pub fn target_width_for(n_sheets: usize, sheet: &SheetConfig) -> f32 {
+    debug_assert!(n_sheets >= 1);
+    (n_sheets - 1) as f32 * sheet.pitch() + sheet.width
+}
+
+/// The bounding box of sheet `k` inside the strip: `[k*(W+g), k*(W+g) + W] x [0, H]`.
+///
+/// Used as the sampling window when an item is to be relocated *into a specific sheet*.
+pub fn sheet_bbox(k: usize, sheet: &SheetConfig, height: f32) -> Rect {
+    let x_min = k as f32 * sheet.pitch();
+    Rect::try_new(x_min, 0.0, x_min + sheet.width, height)
+        .expect("sheet bbox should be valid (W > 0, H > 0)")
+}
+
+/// Which sheet an item's collision bbox lies on, derived from its **left** edge.
+///
+/// In a feasible walled layout both edges are on the same sheet, so the choice does not matter;
+/// during a drop attempt items may temporarily overlap a wall, and the left edge is the stable
+/// choice (it keeps items that hang off the strip's right end assigned to the last sheet).
+fn sheet_index_of(bbox: Rect, sheet: &SheetConfig, n: usize) -> usize {
+    ((bbox.x_min / sheet.pitch()).floor().max(0.0) as usize).min(n.saturating_sub(1))
+}
+
+/// The density the *whole* solution would have to reach to fit into `n_target` sheets.
+///
+/// `Σ item area / (n_target * W * H)`. The SPP counterpart of the BPP's
+/// `required_density_for_reduction`: a value above 1.0 proves the reduction impossible, and a value
+/// above a realistic packing density ([`SheetConfig::max_reduction_density`]) makes it hopeless in
+/// practice, so no attempt is made.
+pub fn required_density_for(sep: &Separator, n_target: usize, sheet: &SheetConfig) -> f32 {
+    if n_target == 0 {
+        return f32::INFINITY;
+    }
+    let height = sep.prob.layout.container.outer_orig.bbox().height();
+    let item_area = sep.prob.layout.placed_item_area(&sep.instance);
+    item_area / (n_target as f32 * sheet.width * height)
+}
+
+/// The **sheet-drop / scatter** move: try to make the current solution fit into one sheet fewer.
+///
+/// Precondition: the separator holds a **feasible** solution occupying `n` sheets.
+///
+/// 1. The strip is narrowed to [`target_width_for`]`(n - 1)` — a whole sheet at once, not the
+///    0.1 % fine step. `Separator::change_strip_width` is deliberately **not** used for the item
+///    shifting: its linear "shift everything right of the split" would smear the dropped sheet's
+///    items across the new right-hand end, where they would all pile up on top of each other in the
+///    same place they already were. Instead every item that lived on the dropped sheet is
+///    **relocated to a uniformly random position inside the surviving sheets** (a feasible rotation
+///    is chosen by [`UniformBBoxSampler`]), which spreads them over exactly the holes the fine
+///    shrink can never reach. Overlap is expected and is the separator's job.
+/// 2. The tracker is rebuilt and the workers reseeded (the width changed, so the containers did).
+/// 3. `separate()` is run: if it reaches zero loss the solution now genuinely fits in `n - 1`
+///    sheets and `true` is returned with the separator holding it. Otherwise `false` is returned
+///    and the separator holds the least-infeasible attempt — the caller decides whether to pool it
+///    and roll back.
+///
+/// Determinism: the items are collected in `SlotMap` order and sorted largest-area-first with the
+/// `PItemKey` as tie-break, the destination sheet is assigned round-robin, and the only randomness
+/// is `sep.rng`. Same seed ⇒ same attempt.
+///
+/// Returns `(succeeded, best_attempt, loss)`.
+pub fn try_drop_sheet(
+    sep: &mut Separator,
+    sheet: &SheetConfig,
+    term: &impl Terminator,
+    sol_listener: &mut impl SolutionListener,
+) -> (bool, SPSolution, f32) {
+    let width = sep.prob.strip_width();
+    let n = n_sheets(width, sheet);
+    debug_assert!(n >= 2, "try_drop_sheet requires at least 2 sheets");
+    scatter_and_shrink(sep, sheet, target_width_for(n - 1, sheet), "drop", term, sol_listener)
+}
+
+/// Strike limit used while repairing a scatter; see [`scatter_and_shrink`].
+const SCATTER_STRIKE_LIMIT: usize = 8;
+
+/// No-improvement iteration limit used while repairing a scatter; see [`scatter_and_shrink`].
+const SCATTER_ITER_NO_IMPRV_LIMIT: usize = 400;
+
+/// The engine shared by the sheet-drop and the pack-down: **shrink the strip to `new_width` and
+/// scatter everything that no longer fits over the sheets that survive**, then separate.
+///
+/// `label` only names the move in the log.
+///
+/// Both callers rely on the same two properties:
+/// * every item whose collision bbox starts beyond `new_width` is *re-placed*, uniformly at random,
+///   inside one of the surviving sheets — which is what gets a part across a wall, the thing the
+///   fine shrink can never do;
+/// * the strip really does get narrower, so the vacated tail **stops existing**. That matters more
+///   than it sounds: the separator's own placement search is global, and as long as a large empty
+///   band is still part of the container it will happily park every relocated item straight back
+///   into it, undoing the move. Removing the space is what makes the relocation stick.
+///
+/// Determinism: items are collected in `SlotMap` order and sorted largest-area-first with the
+/// `PItemKey` as tie-break, destinations are assigned round-robin, and the only randomness is
+/// `sep.rng`. Same seed ⇒ same attempt.
+///
+/// Returns `(succeeded, best_attempt, loss)`; on success the separator holds a feasible solution at
+/// `new_width`, on failure the least-infeasible attempt (the caller decides what to do with it).
+fn scatter_and_shrink(
+    sep: &mut Separator,
+    sheet: &SheetConfig,
+    new_width: f32,
+    label: &str,
+    term: &impl Terminator,
+    sol_listener: &mut impl SolutionListener,
+) -> (bool, SPSolution, f32) {
+    let width = sep.prob.strip_width();
+    let n = n_sheets(width, sheet);
+    let n_target = n_sheets(new_width, sheet);
+    let height = sep.prob.layout.container.outer_orig.bbox().height();
+    // Everything must fit left of the new right edge; the last surviving sheet is only usable up to
+    // `new_width`, so its sampling window is clipped there.
+    let last_usable = new_width - (n_target - 1) as f32 * sheet.pitch();
+
+    // --- 1. Which items no longer fit? --------------------------------------------------------
+    // Deterministic order: largest original area first, ties broken by PItemKey.
+    let mut doomed = sep.prob.layout.placed_items.iter()
+        .filter(|(_, pi)| pi.shape.bbox.x_max > new_width)
+        .map(|(pk, pi)| (pk, pi.item_id))
+        .collect_vec();
+    doomed.sort_by_key(|(pk, item_id)| {
+        (Reverse(OrderedFloat(sep.instance.item(*item_id).area())), *pk)
+    });
+
+    if doomed.is_empty() {
+        // Nothing sticks out: a plain width change is all that is needed.
+        sep.change_strip_width(new_width, Some(width + 1.0));
+        let (attempt, ct) = sep.separate(term, sol_listener);
+        let loss = ct.get_total_loss();
+        return (loss == 0.0, attempt, loss);
+    }
+
+    info!("[SHEET] {label} attempt: {} -> {} sheet(s) (width {:.1} -> {:.1}), scattering {} item(s)",
+        n, n_target, width, new_width, doomed.len());
+
+    // --- 2. Relocate them, uniformly at random, over the surviving sheets ----------------------
+    // Round-robin over the destination sheets keeps the scatter balanced without needing a
+    // density computation that would immediately be invalidated by the previous placement.
+    for (i, (pk, item_id)) in doomed.iter().enumerate() {
+        let dst_k = i % n_target;
+        let item = sep.instance.item(*item_id);
+        let mut bbox = sheet_bbox(dst_k, sheet, height);
+        if dst_k == n_target - 1 {
+            // The last surviving sheet is only usable up to the new strip end.
+            bbox = Rect::try_new(bbox.x_min, bbox.y_min, bbox.x_min + last_usable, bbox.y_max)
+                .unwrap_or(bbox);
+        }
+        // The container is still the *old*, wider one here, so an item sampled inside `bbox` is
+        // trivially inside the container as well.
+        match UniformBBoxSampler::new(bbox, item, sep.prob.layout.container.outer_cd.bbox) {
+            Some(sampler) => {
+                // A uniform random position first — that is what spreads the relocated items over
+                // the *whole* of the surviving sheets rather than over one corner of them...
+                let dt = sampler.sample(&mut sep.rng);
+                let pk = sep.move_item(*pk, dt);
+                // ...and then a local search inside the same sheet, so the item at least starts in
+                // the least-colliding spot that sheet has to offer instead of on top of whatever
+                // the random draw happened to hit. This is pure head start for the separation that
+                // follows; it cannot move the item out of the sheet (the sampling window is the
+                // sheet), and it costs one placement search per relocated item.
+                search_best_position_in_sheet(sep, pk, bbox);
+            }
+            None => {
+                // The item does not fit inside a single sheet in any rotation. That can only happen
+                // for an instance whose parts are wider than a sheet, which the walled mode cannot
+                // handle at all; leave it where it is and let the separator deal with it.
+                warn!("[SHEET] item {item_id} does not fit inside one sheet, left in place");
+            }
+        }
+    }
+
+    // --- 3. Narrow the strip. No item may be shifted: they have all been re-placed already, and
+    //        the survivors must stay exactly where they are (that is the layout being reused).
+    //        A split position past the new right end means `change_strip_width` finds nothing to
+    //        shift, while still rebuilding the container (with the correct number of walls), the
+    //        tracker and the workers.
+    sep.change_strip_width(new_width, Some(width + 1.0));
+    debug_assert!(tracker_matches_layout(&sep.ct, &sep.prob.layout));
+
+    // --- 4. Let the separator try to resolve the overlap the scatter introduced ----------------
+    // The scatter is a *global* perturbation (a whole sheet's worth of items land on top of the
+    // others), so the repair is a full re-nesting job, not the local touch-up the fine shrink's
+    // separation does. It therefore gets a deliberately more patient separator: more strikes and
+    // more no-improvement iterations before giving up. Anything less and the attempt reports
+    // "impossible" after a couple of seconds without ever having tried.
+    let outer_cfg = sep.config;
+    sep.config.strike_limit = outer_cfg.strike_limit.max(SCATTER_STRIKE_LIMIT);
+    sep.config.iter_no_imprv_limit = outer_cfg.iter_no_imprv_limit.max(SCATTER_ITER_NO_IMPRV_LIMIT);
+    let (attempt, ct) = sep.separate(term, sol_listener);
+    sep.config = outer_cfg;
+    let loss = ct.get_total_loss();
+    (loss == 0.0, attempt, loss)
+}
+
+/// Rolls the separator back to a solution taken at a **different** strip width.
+///
+/// [`Separator::rollback`] asserts that the width matches, so restoring a wider (pre-drop) solution
+/// needs the width change first. The split position is past the right end so that no item is
+/// shifted — the solution being restored immediately overwrites every placement anyway.
+pub fn rollback_to_width(sep: &mut Separator, sol: &SPSolution) {
+    if sep.prob.strip_width() != sol.strip_width() {
+        let past_end = sep.prob.strip_width().max(sol.strip_width()) + 1.0;
+        sep.change_strip_width(sol.strip_width(), Some(past_end));
+    }
+    sep.rollback(sol, None);
+}
+
+/// The **cross-sheet pack-down** for the compression phase.
+///
+/// Once the sheet count is fixed, the remaining objective is the *last* sheet's leftover band. The
+/// fine compression shortens it in 0.05 % steps by squeezing the strip's right end — but that
+/// pressure stops at the last wall, so it can only ever compact the last sheet's own contents, not
+/// move any of them into the holes of the earlier sheets.
+///
+/// This step attacks the same band in **large** steps instead: the strip is cut back by
+/// `PACK_DOWN_BAND_STEP` of the last sheet's used width at once, and every item that no longer fits
+/// is relocated into an earlier sheet ([`scatter_and_shrink`]), after which a short separation has
+/// to make the result feasible. On success the band is permanently shorter and the step repeats
+/// from there; on failure the cut is halved and retried, down to `PACK_DOWN_MIN_STEP`.
+///
+/// Why the transfer is bundled with a width cut instead of being done item by item: the separator's
+/// placement search is **global over the whole strip**. If the vacated tail of the last sheet is
+/// still part of the container, the search will simply put the relocated item back there — measured
+/// on iso7, every single single-item transfer was undone this way within a fraction of a second.
+/// Removing the space in the same move is what makes the relocation stick.
+///
+/// The result is always feasible and never wider than `init_sol`, so the fine compression that
+/// follows can only improve on it.
+///
+/// Returns the best (feasible) solution found and how many band cuts were accepted.
+pub fn pack_down_sheets(
+    sep: &mut Separator,
+    sheet: &SheetConfig,
+    init_sol: &SPSolution,
+    term: &impl Terminator,
+    sol_listener: &mut impl SolutionListener,
+) -> (SPSolution, usize) {
+    // The exploration phase leaves the separator at the *last attempted* (narrower, infeasible)
+    // width, not at `init_sol`'s, so the rollback has to change the width first.
+    rollback_to_width(sep, init_sol);
+    let mut best_sol = init_sol.clone();
+
+    let n = n_sheets(sep.prob.strip_width(), sheet);
+    if n < 2 {
+        info!("[SHEET] pack-down: only one sheet, nothing to pack down");
+        return (best_sol, 0);
+    }
+    let start = Instant::now();
+    let mut n_accepted = 0usize;
+    // Relative size of the next cut, halved on every failure.
+    let mut step = PACK_DOWN_BAND_STEP;
+    // Consecutive failures; the step gives up entirely after `PACK_DOWN_MAX_FAILS` of them.
+    let mut n_failed = 0usize;
+
+    info!("[SHEET] pack-down: {} sheet(s), last sheet used {:.1} mm, budget {:.1}s",
+        n, last_sheet_used_width(best_sol.strip_width(), sheet),
+        term.timeout_at().map_or(f32::INFINITY,
+            |d| d.saturating_duration_since(Instant::now()).as_secs_f32()));
+
+    while !term.kill() && step >= PACK_DOWN_MIN_STEP && n_failed < PACK_DOWN_MAX_FAILS {
+        let width = best_sol.strip_width();
+        let used = last_sheet_used_width(width, sheet);
+        if used <= PACK_DOWN_MIN_BAND {
+            info!("[SHEET] pack-down: the last sheet is (almost) empty, done");
+            break;
+        }
+        // Cut `step` of the last sheet's *used* width away. Never cut past the sheet's left edge:
+        // dropping a whole sheet is the exploration phase's job, not this one's.
+        let target = (width - used * step).max(width - used);
+
+        let sub_term = short_term(term, sheet.pack_down_move_time_limit);
+        let (ok, attempt, loss) = scatter_and_shrink(sep, sheet, target, "pack-down", &sub_term, sol_listener);
+
+        if ok {
+            info!("[SHEET] pack-down: band cut accepted, last sheet {:.1} -> {:.1} mm ({:.3}%)",
+                used, last_sheet_used_width(attempt.strip_width(), sheet),
+                attempt.density(&sep.instance) * 100.0);
+            best_sol = attempt;
+            n_accepted += 1;
+            n_failed = 0;
+            sol_listener.report(ReportType::CmprFeas, &best_sol, &sep.instance);
+            rollback_to_width(sep, &best_sol);
+        } else {
+            n_failed += 1;
+            debug!("[SHEET] pack-down: band cut of {:.1}% failed (min loss {}), halving",
+                step * 100.0, crate::FMT().fmt2(loss));
+            step *= 0.5;
+            // Always resume from the best feasible solution; the failed attempt is discarded.
+            rollback_to_width(sep, &best_sol);
+        }
+    }
+
+    rollback_to_width(sep, &best_sol);
+    info!("[SHEET] pack-down finished: {n_accepted} band cut(s) accepted in {:.1}s, last sheet now {:.1} mm",
+        start.elapsed().as_secs_f32(), last_sheet_used_width(best_sol.strip_width(), sheet));
+    (best_sol, n_accepted)
+}
+
+/// Fraction of the last sheet's used width a pack-down band cut removes at once. Large on purpose:
+/// the point of this step is to force a *cross-sheet* relocation, and a small cut can be answered by
+/// the last sheet's own items shuffling closer together, which the fine compression does better and
+/// far more cheaply.
+const PACK_DOWN_BAND_STEP: f32 = 0.5;
+
+/// Smallest relative band cut still worth attempting; below this the fine compression takes over.
+const PACK_DOWN_MIN_STEP: f32 = 0.05;
+
+/// How many band cuts may fail in a row before the pack-down gives up and hands the rest of the
+/// compression budget to the fine compression.
+///
+/// Kept deliberately small. Measured on madisocad_iso, where no cut is possible at all: three
+/// failing attempts cost 11 of the phase's 20 seconds and left the fine compression with a worse
+/// final band than it reached without the step. The pack-down only pays off where a cut succeeds,
+/// and where one does, it succeeds early.
+const PACK_DOWN_MAX_FAILS: usize = 2;
+
+/// Last-sheet used width (mm) below which the band is considered gone.
+const PACK_DOWN_MIN_BAND: f32 = 1.0;
+
+
+/// Places `pk` at the best position [`search_placement_in`] finds **inside `bbox`**, and returns its
+/// (new) key. If no sample is found at all the item is left untouched.
+///
+/// Note `ref_pk = None`: the item's *current* placement is deliberately **not** offered to the
+/// search as a candidate. In the pack-down the item starts out on the last sheet with a loss of
+/// zero (the layout is feasible), so seeding the search with it would make it the unbeatable
+/// optimum and the "transfer" would be a no-op every single time. Dropping the reference forces the
+/// item into the best position the *target sheet* has to offer, overlap included — which is exactly
+/// the move being attempted, and which the `separate()` that follows is there to repair.
+fn search_best_position_in_sheet(sep: &mut Separator, pk: PItemKey, bbox: Rect) -> PItemKey {
+    // The search needs the layout and the tracker immutably while wanting an RNG mutably, so it
+    // gets its own RNG seeded from the master stream (which keeps the step deterministic).
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(sep.rng.next_u64());
+
+    let best = {
+        let layout = &sep.prob.layout;
+        let item = sep.instance.item(layout.placed_items[pk].item_id);
+        let evaluator = SeparationEvaluator::new(layout, item, pk, &sep.ct);
+        let (best, _) = search_placement_in(
+            layout, item, None, evaluator, sep.config.sample_config, &mut rng, Some(bbox),
+        );
+        best.map(|(dt, _)| dt)
+    };
+
+    match best {
+        Some(dt) => sep.move_item(pk, dt),
+        None => pk,
+    }
+}
+
+/// A private terminator granting `min(remaining budget, limit)`; the SPP twin of the BPP helper of
+/// the same name.
+fn short_term(term: &impl Terminator, limit: Duration) -> BasicTerminator {
+    let budget = match term.timeout_at() {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(limit),
+        None => limit,
+    };
+    let mut t = BasicTerminator::new();
+    t.new_timeout(budget);
+    t
+}
+
+/// **Install the walls into a wall-less (plain strip) solution**, the core of
+/// [`SheetPipeline::PlainFirst`](crate::config::SheetPipeline::PlainFirst).
+///
+/// The plain strip engine produces a much denser layout than a walled run of the same budget —
+/// on iso7, 83.2 % versus 61.5 % — because it never has to fight the walls. That layout cannot be
+/// used directly (parts straddle the sheet boundaries), but it is a far better *starting point*
+/// than anything a walled run reaches on its own, and turning it into a walled one is a **local**
+/// repair rather than a global re-nest:
+///
+/// 1. The plain strip is cut into chunks of `W - slack` mm; `n = ceil(width / (W - slack))` is how
+///    many sheets that takes. Note this uses a *width*, not the pitch: the gaps do not exist yet.
+/// 2. Every item is assigned to a chunk by `k = floor(bbox.x_min / (W - slack))` and translated
+///    right onto sheet `k`. This opens exactly the gap the walls need and, crucially, **moves every
+///    item together with its own chunk**, so all the neighbour relationships inside a chunk survive
+///    untouched. The only items that end up overlapping a wall are the ones that were straddling a
+///    chunk boundary in the first place.
+/// 3. The strip is set to `target_width_for(n)` and the walls are installed.
+///
+/// `slack` is the caller's retry knob: with `slack = 0` the cut is as tight as the material allows
+/// and the repair has nothing but the existing gaps to work with; a positive slack leaves that many
+/// mm free at the right edge of every sheet for the wall-crossers to slide into, at the cost of
+/// needing more sheets.
+///
+/// The caller then runs `separate()`: each wall-crosser has to slide into the free space of its own
+/// or the next sheet, which is a small local move. Returns `n`, the sheet count that was installed.
+///
+/// This function only *prepares* the problem; it does not separate, and the layout it leaves behind
+/// is generally infeasible (that is the point).
+pub fn install_walls_into_plain(sep: &mut Separator, sheet: &SheetConfig, slack: f32) -> usize {
+    let width = sep.prob.strip_width();
+    // The *effective* sheet width the plain layout is cut at. With `slack = 0` this is the real
+    // sheet width and the cut is as tight as possible; a positive slack cuts the plain strip into
+    // shorter chunks, so each chunk has `slack` mm of room inside its sheet for the repair to use.
+    // That costs sheets but is what makes a repair possible when the tight cut is hopeless.
+    let eff_width = (sheet.width - slack).max(sheet.width * 0.25);
+    // Sheets are counted against the effective width: the gaps are about to be inserted.
+    let n = ((width / eff_width).ceil().max(1.0)) as usize;
+    let new_width = target_width_for(n, sheet);
+
+    // Deterministic order (SlotMap iteration is stable, and the shifts are independent anyway).
+    // Item on chunk `k` moves to sheet `k`: from `k*eff_width` to `k*(W+gap)`.
+    let shifts = sep.prob.layout.placed_items.iter()
+        .map(|(pk, pi)| {
+            let k = ((pi.shape.bbox.x_min / eff_width).floor().max(0.0) as usize).min(n - 1);
+            (pk, pi.d_transf, k as f32 * (sheet.pitch() - eff_width))
+        })
+        .filter(|(_, _, shift)| *shift > 0.0)
+        .collect_vec();
+
+    info!("[SHEET] installing walls into the plain strip solution: width {:.1} -> {:.1} ({} sheet(s), \
+           cut every {:.1} mm), shifting {} item(s) right onto their own sheet",
+        width, new_width, n, eff_width, shifts.len());
+
+    // 1. Widen first, so every shifted item stays inside the container at all times. The split
+    //    position is past the right end, so `change_strip_width` shifts nothing by itself.
+    sep.change_strip_width(new_width.max(width), Some(width + 1.0));
+
+    // 2. Apply the per-sheet offsets.
+    for (pk, dt, shift) in shifts {
+        let (x, y) = dt.translation();
+        sep.move_item(pk, DTransformation::new(dt.rotation(), (x + shift, y)));
+    }
+
+    // 3. Settle on the exact target width (a no-op when it already matched) and (re)install the
+    //    walls; `change_strip_width` does the container swap, the tracker rebuild and the worker
+    //    reseed in one go.
+    sep.change_strip_width(new_width, Some(new_width + 1.0));
+    debug_assert!(tracker_matches_layout(&sep.ct, &sep.prob.layout));
+    n
+}
+
+/// **Per-sheet left-compaction** (`--compact-sheets`), the secondary post-pass.
+///
+/// For every sheet except the last, every item is translated as far to the **left inside its own
+/// sheet** as it can go without colliding, largest-x first. The many small gaps between the parts
+/// thus migrate into a single wide reusable band at the right edge of the sheet.
+///
+/// This is deliberately a pure *translation* pass rather than a re-nesting: it cannot make the
+/// solution worse (every step is verified against the CDE and skipped if it collides), it cannot
+/// change the sheet count, and it is cheap enough to always run. A move is only kept when it is
+/// collision-free *and* stays inside the source sheet, so no item can be pushed into a wall.
+///
+/// Returns the compacted solution and the number of items that actually moved.
+pub fn compact_sheets_left(
+    sep: &mut Separator,
+    sheet: &SheetConfig,
+    init_sol: &SPSolution,
+) -> (SPSolution, usize) {
+    rollback_to_width(sep, init_sol);
+    let width = sep.prob.strip_width();
+    let n = n_sheets(width, sheet);
+    if n < 2 {
+        return (init_sol.clone(), 0);
+    }
+
+    let mut n_moved = 0usize;
+    // Left to right: an item may only slide into space an already-processed item has vacated, so a
+    // single left-to-right sweep per sheet is the right order (and is deterministic).
+    let mut order = sep.prob.layout.placed_items.iter()
+        .filter(|(_, pi)| sheet_index_of(pi.shape.bbox, sheet, n) < n - 1)
+        .map(|(pk, pi)| (pk, OrderedFloat(pi.shape.bbox.x_min)))
+        .collect_vec();
+    order.sort_by_key(|(pk, x)| (*x, *pk));
+
+    for (pk, _) in order {
+        if !sep.prob.layout.placed_items.contains_key(pk) {
+            continue;
+        }
+        let (dt, bbox) = {
+            let pi = &sep.prob.layout.placed_items[pk];
+            (pi.d_transf, pi.shape.bbox)
+        };
+        let k = sheet_index_of(bbox, sheet, n);
+        let sheet_x_min = k as f32 * sheet.pitch();
+        // How far left the item could go at most before hitting its own sheet's left edge.
+        let max_shift = bbox.x_min - sheet_x_min;
+        if max_shift <= COMPACT_MIN_SHIFT {
+            continue;
+        }
+
+        // Binary search on the shift: the largest collision-free displacement, to within
+        // `COMPACT_MIN_SHIFT`. `try_shift` restores the item on failure, so the layout is unchanged
+        // whenever the probe collides.
+        let (mut lo, mut hi) = (0.0f32, max_shift);
+        let mut best_pk = pk;
+        let mut best_shift = 0.0f32;
+        while hi - lo > COMPACT_MIN_SHIFT {
+            let mid = 0.5 * (lo + hi);
+            match try_shift(sep, best_pk, dt, mid) {
+                Some(new_pk) => {
+                    // `mid` works; keep it and try to go further left.
+                    best_pk = new_pk;
+                    best_shift = mid;
+                    lo = mid;
+                }
+                None => hi = mid,
+            }
+        }
+        if best_shift > 0.0 {
+            n_moved += 1;
+        }
+    }
+
+    let sol = sep.prob.save();
+    info!("[SHEET] per-sheet left-compaction: {n_moved} item(s) shifted left within their sheet");
+    (sol, n_moved)
+}
+
+/// Smallest displacement the left-compaction bothers with (mm). Also the binary search's tolerance.
+const COMPACT_MIN_SHIFT: f32 = 0.5;
+
+/// Tries to place the item currently at `pk` at `dt` shifted `shift` mm to the left.
+/// Returns the new key on success (collision-free), or `None` after restoring the original
+/// placement when the shifted position collides with anything.
+fn try_shift(sep: &mut Separator, pk: PItemKey, dt: DTransformation, shift: f32) -> Option<PItemKey> {
+    let (x, y) = dt.translation();
+    let shifted = DTransformation::new(dt.rotation(), (x - shift, y));
+    let new_pk = sep.move_item(pk, shifted);
+    if sep.ct.get_loss(new_pk) == 0.0 {
+        Some(new_pk)
+    } else {
+        // Undo: put it back exactly where it was.
+        sep.move_item(new_pk, dt);
+        None
+    }
 }

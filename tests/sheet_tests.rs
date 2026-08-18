@@ -48,7 +48,7 @@ mod sheet_integration_tests {
     const INSTANCE_BASE_PATH: &str = "data/input";
 
     fn sheet(width: f32, gap: f32) -> SheetConfig {
-        SheetConfig { width, gap, compact_sheets: false }
+        SheetConfig::new(width, gap, false)
     }
 
     fn import_spp(path: &str, min_sep: Option<f32>) -> Result<SPInstance> {
@@ -271,6 +271,66 @@ mod sheet_integration_tests {
         assert_eq!(count_straddling(&final_sol, &sc), 0, "no item may straddle a wall");
         let layout = jagua_rs::entities::Layout::from_snapshot(&final_sol.layout_snapshot);
         assert!(layout.is_feasible());
+        Ok(())
+    }
+
+    /// (d) **Phase 8 sheet-drop.** A synthetic instance whose LBF start needs three sheets while
+    /// two are comfortably enough: 8 rectangles of 900 x 450 in 2000 x 1000 sheets. Two sheets hold
+    /// 4,000,000 mm2 and the parts total 3,240,000 mm2, i.e. 81 % — but laid out as 2 columns x 2
+    /// rows per sheet the fit is exact and obvious, so the walled optimizer must get to 2 sheets.
+    ///
+    /// This is the regression test for the cross-sheet relocation operator: without it the run gets
+    /// stuck at whatever sheet count the fine shrink happens to land on.
+    #[test]
+    fn sheet_drop_reaches_two_sheets() -> Result<()> {
+        const W: f32 = 900.0;
+        const H: f32 = 450.0;
+        let ext = ExtSPInstance {
+            name: "sheet_drop_synth".to_string(),
+            strip_height: 1000.0,
+            items: vec![ExtItem {
+                base: ExtBaseItem {
+                    id: 0,
+                    allowed_orientations: Some(vec![0.0, 90.0, 180.0, 270.0]),
+                    shape: ExtShape::SimplePolygon(ExtSPolygon(vec![
+                        (0.0, 0.0), (W, 0.0), (W, H), (0.0, H),
+                    ])),
+                    min_quality: None,
+                },
+                demand: 8,
+            }],
+        };
+        let config = {
+            let mut c = DEFAULT_SPARROW_CONFIG;
+            c.apply_sheet(Some(sheet(2000.0, 20.0)));
+            c.expl_cfg.time_limit = Duration::from_secs(20);
+            c.cmpr_cfg.time_limit = Duration::from_secs(10);
+            c
+        };
+        let sc = config.sheet.unwrap();
+        let importer = Importer::new(
+            config.cde_config, config.poly_simpl_tolerance,
+            config.min_item_separation, config.narrow_concavity_cutoff_ratio,
+        );
+        let instance = jagua_rs::probs::spp::io::import_instance(&importer, &ext)?;
+
+        let mut listener = DummySolListener;
+        let mut terminator = BasicTerminator::new();
+        let final_sol = sparrow::optimizer::optimize(
+            instance.clone(),
+            Xoshiro256PlusPlus::seed_from_u64(0),
+            &mut listener,
+            &mut terminator,
+            &config.expl_cfg,
+            &config.cmpr_cfg,
+            None,
+        );
+
+        let sheets = n_sheets(final_sol.strip_width(), &sc);
+        assert!(sheets <= 2, "8 parts of 900x450 must fit in 2 sheets of 2000x1000, got {sheets}");
+        assert_eq!(count_straddling(&final_sol, &sc), 0, "no item may straddle a wall");
+        let layout = jagua_rs::entities::Layout::from_snapshot(&final_sol.layout_snapshot);
+        assert!(layout.is_feasible(), "the final walled solution must be feasible");
         Ok(())
     }
 
