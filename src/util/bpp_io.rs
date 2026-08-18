@@ -78,10 +78,39 @@ pub struct BppCli {
                 Uses otherwise idle CPU cores; each run uses its own worker threads (see #workers in the log)")]
     pub parallel_runs: u64,
 
+    /// Direction of the compression phase's cross-bin pack-down step.
+    #[arg(long = "pack-down", value_name = "STRATEGY", default_value = "concentrate",
+        help = "Direction of the pack-down step: 'concentrate' (default) moves items out of the sparsest bins into the \
+                densest ones, so the leftover ends up as few large offcuts; 'spread' does the reverse, evening the \
+                leftover out over all bins as many medium bands")]
+    pub pack_down: PackDownStrategyArg,
+
     /// Bin types (repeatable). Only used when the input file does not already define bins.
     #[arg(long = "bin", value_name = "WxH[:stock[:cost]]",
         help = "Declare a rectangular bin type, e.g. --bin 3200x3200:10:1 (stock defaults to 1000, cost to 1). Repeatable; bins get ids 0.. in the order given")]
     pub bins: Vec<BinSpec>,
+}
+
+/// CLI spelling of [`PackDownStrategy`](crate::config::PackDownStrategy).
+///
+/// A separate type so `clap`'s `ValueEnum` derive stays out of `config.rs` (which is CLI-agnostic
+/// and also used by the library tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum PackDownStrategyArg {
+    /// Sparsest bins are emptied into the densest ones: few, large offcuts. The recommended default.
+    #[default]
+    Concentrate,
+    /// Densest bins are emptied into the sparsest ones: the leftover is evened out over all bins.
+    Spread,
+}
+
+impl From<PackDownStrategyArg> for crate::config::PackDownStrategy {
+    fn from(a: PackDownStrategyArg) -> Self {
+        match a {
+            PackDownStrategyArg::Concentrate => crate::config::PackDownStrategy::Concentrate,
+            PackDownStrategyArg::Spread => crate::config::PackDownStrategy::Spread,
+        }
+    }
 }
 
 /// A rectangular bin type as declared on the command line: `WxH[:stock[:cost]]`.

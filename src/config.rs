@@ -175,6 +175,48 @@ pub struct BPExplorationConfig {
 /// Relative improvement in the best min-loss that counts as "progress" for the stagnation stop.
 pub const STAGNATION_MIN_IMPROVEMENT: f32 = 0.02;
 
+/// In which *direction* the pack-down step ([`crate::optimizer::bpp::compress::pack_down`]) moves
+/// items between bins.
+///
+/// Both strategies leave the bin count and the total density untouched — they only decide **where
+/// the slack sits**, which is the secondary objective. They are exact mirror images of each other:
+/// the same code path is used, only the source/destination orderings are reversed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PackDownStrategy {
+    /// **Concentrate** (default, recommended): sources are the *sparsest* bins, destinations the
+    /// *densest* ones that still have room. The slack migrates out of the sparse bins into the
+    /// dense ones, so the leftover ends up as **few, large** offcuts (in the limit: one nearly
+    /// empty bin, i.e. a full sheet back in stock).
+    #[default]
+    Concentrate,
+    /// **Spread**: the reverse direction — sources are the *densest* bins, destinations the
+    /// *sparsest* ones with the most free area. This evens the leftover out over all bins (many
+    /// medium-sized bands instead of a few large ones). Useful only when downstream processing
+    /// wants a similar offcut in every sheet; for reusable material `Concentrate` is almost always
+    /// the better choice.
+    Spread,
+}
+
+impl PackDownStrategy {
+    /// Whether the *source* bins are visited in ascending density order (`Concentrate`) or in
+    /// descending order (`Spread`).
+    pub fn source_ascending(self) -> bool {
+        self == PackDownStrategy::Concentrate
+    }
+
+    /// Whether a layout of density `dst_density` is a valid destination for a source of density
+    /// `src_density`: strictly denser under `Concentrate`, strictly sparser under `Spread`.
+    ///
+    /// Requiring strictness is what makes the step terminate — a move always goes "downhill" in a
+    /// fixed direction, so two bins can never keep swapping the same item back and forth.
+    pub fn accepts_destination(self, src_density: f32, dst_density: f32) -> bool {
+        match self {
+            PackDownStrategy::Concentrate => dst_density > src_density,
+            PackDownStrategy::Spread => dst_density < src_density,
+        }
+    }
+}
+
 /// Configuration of the BPP compression phase ([`crate::optimizer::bpp::compress::compression_phase`]).
 #[derive(Debug, Clone, Copy)]
 pub struct BPCompressionConfig {
@@ -204,6 +246,11 @@ pub struct BPCompressionConfig {
     /// exploration one: a pack-down attempt is a *local* repair (one extra item in one bin), and
     /// hundreds of them are made, so few iterations and few strikes per attempt.
     pub pack_down_separator_config: SeparatorConfig,
+    /// Which *direction* the pack-down step moves items in. See [`PackDownStrategy`].
+    pub pack_down_strategy: PackDownStrategy,
+    /// Minimum budget granted to a single bin's strip consolidation when the remaining compression
+    /// budget is shared fairly over all bins (`remaining / n_remaining_bins`, floored at this).
+    pub consolidation_min_time_per_bin: Duration,
 }
 
 /// The BPP counterpart of [`DEFAULT_SPARROW_CONFIG`]: identical separator, sampling and geometry
@@ -244,6 +291,8 @@ pub const DEFAULT_BPP_CONFIG: BPConfig = BPConfig {
             n_workers: DEFAULT_SPARROW_CONFIG.cmpr_cfg.separator_config.n_workers,
             sample_config: DEFAULT_SPARROW_CONFIG.cmpr_cfg.separator_config.sample_config,
         },
+        pack_down_strategy: PackDownStrategy::Concentrate,
+        consolidation_min_time_per_bin: Duration::from_secs(1),
     },
     cde_config: DEFAULT_SPARROW_CONFIG.cde_config,
     poly_simpl_tolerance: DEFAULT_SPARROW_CONFIG.poly_simpl_tolerance,

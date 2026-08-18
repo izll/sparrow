@@ -79,6 +79,8 @@ fn main() -> Result<()> {
     if let Some(arg_rng_seed) = args.rng_seed {
         config.rng_seed = Some(arg_rng_seed as usize);
     }
+    config.cmpr_cfg.pack_down_strategy = args.pack_down.into();
+    info!("[MAIN] pack-down strategy: {:?}", config.cmpr_cfg.pack_down_strategy);
 
     info!("[MAIN] configured to explore for {}s and compress for {}s", explore_dur.as_secs(), compress_dur.as_secs());
 

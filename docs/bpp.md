@@ -132,6 +132,9 @@ cargo build --release --features only_final_svg
                                  Overrides the SPARROW_MIN_SEP env var; default: none
 -p, --parallel-runs <N>          Run N independent optimizations in parallel (seeds seed..seed+N-1)
                                  and keep the best (default: 1)
+    --pack-down <STRATEGY>       Direction of the compression phase's cross-bin pack-down step:
+                                 'concentrate' (default) drains the sparse bins into the dense ones
+                                 (few large offcuts), 'spread' does the reverse (even leftover)
     --bin <WxH[:stock[:cost]]>   Declare a rectangular bin type. Repeatable
 -h, --help                       Print help
 ```
@@ -188,9 +191,9 @@ biggest usable offcut) wins, rather than the one that spreads the same slack eve
                     ┌──────────────────▼───────────────────────────┐
                     │ 3. Compression  (bpp/compress.rs)            │
                     │    repeat while time remains:                │
-                    │      pack-down: move items out of the         │
-                    │        least-dense bin into the others       │
-                    │      consolidate the least-dense bin's rest  │
+                    │      pack-down: every bin as source, items   │
+                    │        move to the denser bins (or reverse)  │
+                    │      consolidate EVERY bin into one band     │
                     └──────────────────┬───────────────────────────┘
                                        ▼  final solution
 ```
@@ -325,23 +328,51 @@ budget runs out or a full round changes nothing.
 
 #### 3a. Pack-down — cross-layout (`pack_down`)
 
-The step that actually makes the remainder *one* piece: it empties the least dense bin into the
-others, item by item.
+The step that actually makes the remainder *one* piece: it migrates items from the sparse bins into
+the dense ones, item by item, until nothing more will move.
 
 ```
-loop while time remains:
-  L = least dense open layout                    (skip if only one layout)
-  for every item of L, largest original area first (ties by PItemKey → deterministic):
-    for every other layout M, most free area first (container.area - placed_item_area):
-      snapshot = sep.save()                      (solution + all tracker snapshots)
-      transfer the item L -> M at a random feasible-rotation position inside M's bbox
-      search its lowest-loss position in M       (SeparationEvaluator + search_placement, as in the workers)
-      separate() with a short budget             (the global "make room" step: it may move items
-                                                  inside M — and anywhere else, the loss is global)
-      total loss == 0 and feasible?  → accept, next item of L
-      else                           → rollback(snapshot), try the next M
-  stop when a full pass over L moved nothing
+repeat while a pass moved something and time remains:
+  for every open layout L as source, ascending density   (least dense first)
+    for every item of L, largest original area first (ties by PItemKey → deterministic):
+      for every layout M *denser* than L, most free area first (container.area - placed_item_area),
+          skipping M whose free area < the item's area:
+        cheap prefilter: can any guaranteed-empty band of M host the item? no → skip M
+        snapshot = sep.save()                      (solution + all tracker snapshots)
+        transfer the item L -> M at a random feasible-rotation position inside M's bbox
+        search its lowest-loss position in M       (SeparationEvaluator + search_placement, as in the workers)
+        separate() with a short budget             (the global "make room" step: it may move items
+                                                    inside M — and anywhere else, the loss is global)
+        total loss == 0 and feasible?  → accept, next item of L
+        else                           → rollback(snapshot), try the next M
+  log a one-line summary per source bin, and one for the whole step
 ```
+
+**Every bin is a source, not just the sparsest one** (the phase-6 change). Taking only the least
+dense bin looks right — that is where the biggest offcut is — but it fails badly whenever the
+sparsest bin holds a single oversized piece that fits nowhere: the step then tries one source, one
+destination, and returns in 0.0 s with its entire budget untouched, while the *second* and *third*
+sparsest bins hold small items that would have slotted into a dense bin without trouble. That is
+exactly what the `iso6` customer instance does (see *Measured results*).
+
+**Destinations are restricted to the far side of the source in the density ordering** — strictly
+denser bins under `Concentrate`, strictly sparser ones under `Spread`. Requiring *strict*
+inequality is what makes the step terminate: every accepted move goes downhill in a fixed direction,
+so two bins can never keep passing the same item back and forth.
+
+**The cheap prefilter** (`placement_is_hopeless`) skips an (item, destination) pair before any
+problem mutation or separation happens. It projects the destination's placed bboxes onto each axis,
+merges the intervals, and takes the widest uncovered gap — that is the widest *guaranteed-empty*
+vertical band (full container height) and horizontal band (full container width). If either band can
+host the item's smallest bbox dimension over all its allowed rotations, a placement provably exists
+and the pair is tried.
+
+The converse does **not** hold — free space can be an L-shape no axis projection sees — so a missing
+band alone is never enough to reject. The rejection therefore requires a second, independent
+witness: the destination must not even have the item's area free. Only when *both* say no is the
+pair skipped. This asymmetry is deliberate and was measured: an earlier version rejected on the band
+test alone and silently threw away 6 of 8 legal moves on `iso6`, ending at 58.1 % on the target bin
+instead of 52.7 %. A prefilter that is merely cheap is worth far less than one that is *never wrong*.
 
 The cross-layout move itself is `BPSeparator::transfer_item`, the transactional primitive phase 1–3
 deferred. It embraces jagua-rs' auto-close semantics rather than fighting them: removing the *last*
@@ -359,11 +390,42 @@ The step uses its own, deliberately cheap separator (`pack_down_separator_config
 are made, and each attempt is capped at `pack_down_move_time_limit` (2 s). Pack-down as a whole may
 use `pack_down_time_ratio` (60 %) of the remaining compression budget; the rest is reserved for 3b.
 
-**Per-item diagnostics.** Every source item produces exactly one info line, whatever the outcome:
+#### 3a-bis. The pack-down strategy switch (`--pack-down`)
+
+`BPCompressionConfig::pack_down_strategy` decides the **direction** items move in. Both values use
+the same code path — only the source and destination orderings are reversed:
+
+| Strategy | Sources | Destinations | Result |
+| --- | --- | --- | --- |
+| `Concentrate` (**default**) | sparsest bins first | denser bins, most free area first | **Few, large** offcuts: the slack drains out of the sparse bins into the dense ones |
+| `Spread` | densest bins first | sparser bins, most free area first | Leftover **evened out**: many medium bands, one per bin |
+
+Neither can change the bin count upwards or make the solution infeasible, and neither changes the
+*total* density — once the bin count is settled, the total slack is fixed and the only question is
+**where it sits**.
+
+**`Concentrate` is the recommended default, and here is the honest trade-off.** For reusable
+material a single 470 x 990 offcut is worth much more than nine 50 x 990 slivers: it can still be
+cut into a real part, whereas the slivers are scrap in all but name. `Concentrate` maximises the
+largest offcut, and in the best case empties a bin entirely (the sheet goes back to stock and the
+bin count drops as a bonus). `Spread` is the right choice only when downstream processing genuinely
+wants a similar margin in every sheet — e.g. a fixed clamping or trim allowance per plate. On `iso6`
+the two produce per-bin densities of 30–88 % (`Concentrate`) versus 30–57 % (`Spread`) at the same
+9 bins: `Spread` visibly levels the bins out, and just as visibly gives up the large offcut.
+
+```bash
+sparrow-bpp -i my_instance.json --bin 2000x1000 -e 30 -c 20 --pack-down spread
+```
+
+**Per-item diagnostics.** Every source item produces exactly one info line, whatever the outcome,
+plus one summary line per source bin and one for the whole step:
 
 ```
-[BPCMPR] item 6 (513x605 bbox) from bin LayKey(10v17): tried 11 bins,
+[BPCMPR] item 6 (513x605 bbox) from bin LayKey(10v17): tried 11 bins (2 prefiltered),
          best residual loss 64.8 K (bin LayKey(11v19)) -> kept in place
+[BPCMPR] pass 1: source bin LayKey(10v17) (dens 30.787%) -> 0 item(s) moved out, 2 left
+[BPCMPR] pack-down (Concentrate) finished: 8 item(s) moved across bins in 2 pass(es),
+         0.0s, 9 bin(s), cost 9
 ```
 
 `best residual loss` is the lowest collision loss any destination was left with after the short
@@ -383,11 +445,34 @@ information such a step needs.
 
 #### 3b. Strip consolidation — intra-layout (`consolidate_layout`)
 
-The **least dense** bin (recomputed: pack-down may have changed which one that is) is lifted into a
-*strip packing subproblem*: its items become a fresh `SPInstance` whose strip has the bin's height and
-starts at the width its content currently occupies, seeded with the current placements. The existing
-SPP exploration phase is then asked to shrink that strip. If it succeeds, the narrower placements are
-translated back and written into the BPP layout.
+**Every** open bin is consolidated, in ascending density order (least dense first) — the phase-6
+change. Each bin is lifted into a *strip packing subproblem*: its items become a fresh `SPInstance`
+whose strip has the bin's height and starts at the width its content currently occupies, seeded with
+the current placements. The existing SPP exploration phase is then asked to shrink that strip. If it
+succeeds, the narrower placements are translated back and written into the BPP layout.
+
+Consolidating only the sparsest bin left the *dense* bins full of scattered gaps — which is both a
+worse offcut in its own right and, more importantly, the reason pack-down had nowhere to move
+anything. On `iso6` the three dense bins were using 1814 / 1960 / 1947 mm of 1985; after the sweep
+they use 1609 / 1818 / 1761, and the bands that opens are what let pack-down finally move 8 items.
+
+**Budgeting.** Each bin gets `remaining / n_remaining_bins` of the sweep budget, floored at
+`consolidation_min_time_per_bin` (1 s) and capped by `consolidation_expl_cfg.time_limit`. Without
+the share the least dense bin would consume everything and the dense bins would never get a turn.
+The sweep as a whole is capped at `1 - pack_down_time_ratio` of the round's budget, which is what
+keeps the alternation alive: round 1's pack-down almost always finds nothing (no bands exist yet),
+so if the sweep could consume the rest, the round-2 pack-down that can finally exploit those bands
+would never run.
+
+**Bins that cannot benefit are skipped** rather than charged for a pointless run:
+
+* a bin holding **≤ 1 item** — there is nothing to compact against anything;
+* a bin whose content already spans (practically) the **whole container width** — it is flush by
+  definition, and there is no narrower strip to find.
+
+A third case can only be detected afterwards: the strip run finishes without narrowing the content
+(`1510.060 -> 1510.211`). That is reported and treated as a failure, so the caller rolls back and
+the bin keeps its original placements.
 
 The write-back is fully guarded: the rebuilt layout is verified with jagua-rs' own CDE
 (`Layout::is_feasible()` **and** total tracker loss `== 0`), and the item count and demand are checked.
@@ -428,8 +513,10 @@ All defaults live in `DEFAULT_BPP_CONFIG` (`src/config.rs`).
 | `pack_down_time_ratio` | `0.6` | Share of the *remaining* compression budget pack-down may use per round; the rest is reserved for the strip consolidation. |
 | `pack_down_move_time_limit` | `2 s` | Budget for one pack-down attempt (one item into one destination bin). `-x` halves it. |
 | `pack_down_separator_config` | 50 iters / 2 strikes | Deliberately cheap separator for the "make room" step. `-x` halves both limits. |
-| `consolidate_remainder` | `true` | Run the strip consolidation of the least dense bin. |
+| `pack_down_strategy` | `Concentrate` | Direction items move in: `Concentrate` (sparse → dense, few large offcuts) or `Spread` (dense → sparse, even leftover). CLI: `--pack-down`. |
+| `consolidate_remainder` | `true` | Run the strip consolidation sweep over all bins. |
 | `consolidation_expl_cfg` | 30 s, shrink 0.005 | The SPP sub-optimization used for it; its `time_limit` caps a *single* consolidation attempt. |
+| `consolidation_min_time_per_bin` | `1 s` | Floor for one bin's share of the sweep budget (`remaining / n_remaining_bins`). |
 | `separator_config` | 100 iters / 5 strikes | Separator the phase is constructed with (restored around each pack-down round). |
 
 ---
@@ -492,11 +579,66 @@ of the least dense bin: the width of the contiguous rectangular remainder.
 | `swim.json`, `--bin 3200x3200`, `-e 10 -c 25 -s 0` — after exploration | 4 | 48.8 % | — | — |
 | `swim.json`, `--bin 3200x3200`, `-e 10 -c 25 -s 0` — **with pack-down** | 4 | **29.9 %** | — | — |
 
+### Phase 6 regression check (the other three instances must not move)
+
+Same commands as before, `sparrow-bpp` release build:
+
+| Instance | Before phase 6 | After phase 6 |
+| --- | --- | --- |
+| `iso6`, `--bin 1990x995:25:1 --min-sep 5`, `-e 15 -c 10 -s 42` | 9 bins, 0 moves, min-bin 30.1 %, 3rd-densest bin 67.2 % @ 1814 width | 9 bins, **8 moves**, min-bin 30.1 %, 3rd-densest **52.7 % @ 1510** |
+| `o90`, `--bin 1990x995:25:1 --min-sep 5`, `-e 15 -c 10 -s 42` | 12 bins, 57.13 %, 0 moves, 8.0 s | 12 bins, 57.13 %, 0 moves, 21.0 s |
+| `swim`, `--bin 3200x3200`, `-e 10 -c 10 -s 0` | 4 bins, 62.12 %, min-bin 37.7 %, 3 moves, 20.1 s | 4 bins, 62.12 %, min-bin 37.7 %, 3 moves, **that bin now 1813 / 3200 wide**, 21.1 s |
+| 112 parts, `--bin 2000x1000`, `-e 30 -c 20 -s 42` | 4 bins, 70.72 %, min-bin 41.9 % @ 1308 width, 10 moves, 44.7 s | 4 bins, 70.72 %, min-bin 41.9 % @ **1308** width, 10 moves, 44.0 s |
+
+No regressions: bin counts, total densities and min-bin densities are identical everywhere. `o90`
+legitimately spends its previously-unused budget re-checking all 12 bins as sources and finding
+nothing — 12 bins is the proven optimum and all its bins are genuinely full, so the extra 13 s buy
+nothing but also cost nothing (the phase runs inside the budget the user already granted). On `swim`
+the per-bin sweep additionally compacts the sparse bin from 3195 to 1813 of 3200, which the
+old single-bin consolidation had not achieved.
+
 The bin count is unchanged in all three cases — it is already area-optimal (3 bins of 2000x1000 would
 need 94.3 % density, one bin of 3000x1500 would need 125.7 %) — and that is the point: the *total*
 density cannot improve either, so the only thing left to optimise is **where** the slack sits. Pack-down
 moves it out of three bins into one, turning the 112-part result from "four bins each with a sliver of
 waste" into "three nearly full bins plus a 692 x 1000 clean offcut".
+
+### The `iso6` case — the instance phase 6 was built for
+
+`iso6` is 49 items in 7 rectangle types, all ~600 wide (9x 600x992, 1x 600x540, 7x 600x101.8,
+21x 599.7x95.8, 7x 600x101.9, 1x 600x892, 3x 600x508), into 1990 x 995 bins with `--min-sep 5`:
+
+```bash
+sparrow-bpp -i iso6.json --bin 1990x995:25:1 --min-sep 5 -e 15 -c 10 -s 42
+```
+
+**9 bins is a proven lower bound** and both versions reach it, so the bin count is not the story —
+the *secondary* objective is. The nine inflated 997 x 605 copies of the tallest part must lie down
+(997 > 990), and two of them do not fit side by side in 1985, so each needs its own bin.
+
+| Metric | Before phase 6 | After phase 6 |
+| --- | --- | --- |
+| Bins / total density | 9 / 48.19 % | 9 / 48.19 % (unchanged, both optimal) |
+| Per-bin densities | 30.1 / 30.1 / 30.1 / 30.1 / 45.5 / 45.5 / **67.2 / 76.7 / 78.7** | 30.1 / 30.1 / 30.1 / 30.1 / 45.5 / 45.5 / **52.7 / 82.1 / 87.8** |
+| Pack-down moves | **0** | **8** |
+| Pack-down sources tried | 1 (of 9) | **9 (of 9)** |
+| Bins consolidated | 0 (only the sparsest was even tried, and it holds 1 item) | **3** (of 9; the other 6 are correctly skipped) |
+| Used width, 67 % bin | 1814 / 1985 | **1510** / 1985 (offcut 171 → **475**) |
+| Used width, 77 % bin | 1960 / 1985 | 1984 / 1985 (deliberately filled up) |
+| Used width, 79 % bin | 1947 / 1985 | 1985 / 1985 (deliberately filled up) |
+| Compression time used | **0.0 s** of 23.4 s available | **22 s** of 23.4 s |
+| Wall clock | 1.7 s | 23.5 s |
+
+The mechanism is the alternation, and the log shows it plainly: round 1's pack-down still moves
+nothing (no bin has a band yet), the sweep then narrows the three dense bins, and *round 2's*
+pack-down immediately starts moving items into the space that opened. Five rounds later the target
+bin has gone 14 → 6 items and its offcut has nearly tripled, while the two dense bins are packed to
+99.97 % of their width.
+
+What phase 6 does **not** fix on this instance: the two 45.5 % bins keep their small item. That item
+is 513 x 605 inflated, and the widest band any denser bin can offer is 475 — a genuine geometric
+rejection, correctly identified by the prefilter rather than by a wasted separation. Moving it would
+need a *group* transfer that also relocates a neighbour.
 
 ### The `o90` case — why 12 bins is the answer, not 10
 
@@ -560,13 +702,15 @@ These are deliberate v1 scope decisions, not bugs:
 * **One bin type per opened layout, chosen greedily.** The bin type is picked by lowest `cost / area`
   among those with stock, at the moment the bin is opened. There is no search over the *mix* of bin
   types, so heterogeneous-bin instances are handled greedily rather than optimally.
-* **Consolidation targets only the least dense bin.** Both compression steps work on one bin — the
-  least dense one, where the largest offcut is. Other bins are only reported on (and receive the items
-  pack-down evicts).
-* **Pack-down is greedy and first-fit.** Items leave the sparsest bin largest-first and enter the first
+* **Pack-down is greedy and first-fit.** Items leave a source bin largest-first and enter the first
   destination that accepts them; there is no look-ahead over *which* item should go *where*, and no
   backtracking over an accepted move. A move is also never undone once accepted, even if a later one
   would have been better.
+* **Pack-down is single-item.** A move that only becomes possible when two items travel together is
+  never found. `BPSeparator::transfer_item` is the primitive a group version would loop over.
+* **Consolidation is one attempt per bin per round.** A bin that fails to narrow is not retried with
+  a different seed within the same round, and the fair-share budget means a bin that needed slightly
+  more time simply does not get it.
 * **The area bound is a heuristic cap, not a proof.** With the default `max_reduction_density = 0.90`
   the exploration also skips reductions that are merely *unlikely* (needing 90–100 % density). Set it
   to `1.0` for a pure "provably impossible" bound at the cost of spending the budget on long shots.
@@ -602,8 +746,14 @@ fixed seed and worker count, which is what the determinism note above asks for. 
 take `&impl Terminator`, so nothing else has to change.
 
 **A different secondary objective.** `compress::compression_phase` is where the tie-break lives.
-`report_stats` already computes per-bin density and used width; consolidating *every* bin, or
-optimising for a target offcut size, plugs in there.
+`layout_stats` computes per-bin density and used width; consolidating every bin and the
+`Concentrate`/`Spread` switch are already built on it, and optimising for a *target* offcut size
+(rather than the largest one) plugs in at the same point.
+
+**Group / column transfer.** The one thing single-item pack-down provably cannot do on `iso6`: move
+a 513 x 605 piece into a bin whose widest band is 475, by relocating a neighbour at the same time.
+`BPSeparator::transfer_item` is the primitive to loop over, and `placement_is_hopeless` already
+computes the band widths such a step needs to decide *which* neighbour to take along.
 
 ---
 

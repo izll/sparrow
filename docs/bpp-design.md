@@ -160,10 +160,85 @@ back into that layout (offset by the container bbox origin) — only if the resu
 
 ## Status (2026-08-18)
 
-Phases 1–**5** are complete. `cargo test` is green (18 tests: 3 SPP integration + 15 BPP), `cargo
-clippy --all-targets` is clean for all BPP files (the only two remaining warnings are pre-existing
-`collapsible_if`s in the SPP `separator.rs`), and `cargo build --release` (also with `--features
-only_final_svg`) succeeds.
+Phases 1–**6** are complete. `cargo test` is green (30 tests: 3 SPP integration + 6 fit-parity +
+21 BPP), `cargo clippy --all-targets` is clean for all BPP files (the only two remaining warnings
+are pre-existing `collapsible_if`s in the SPP `separator.rs`), and `cargo build --release` succeeds.
+
+### Phase 6 — pack-down over all bins, per-bin consolidation, strategy switch
+
+The problem phase 6 was asked to solve, on the real `iso6` customer instance (49 items, 7 rectangle
+types, all ~600 wide, `--bin 1990x995:25:1 --min-sep 5 -e 15 -c 10 -s 42`): the pipeline reached the
+proven optimum of 9 bins, but **pack-down did nothing**. It took only the least dense bin as source
+— a lonely 997 x 605 piece that fits nowhere — tried a single destination, and finished in 0.0 s
+although 10 s were available. Strip consolidation then also ran only on that one-item bin, where
+there is nothing to compact. Meanwhile the 67–79 % bins were full of scattered gaps and the two
+45 % bins each held a big piece plus a small one.
+
+Bin count was already optimal, so this is squarely a **secondary-objective** problem: get the
+leftover into as few, as large, as rectangular pieces as possible.
+
+| Item | Where |
+| --- | --- |
+| `pack_down` iterates over **all** layouts as source, ascending density; destinations restricted to strictly denser layouts, most free area first, free area ≥ item area | `src/optimizer/bpp/compress.rs` |
+| Repeated full passes while a pass still moves something and time remains; per-source-bin + per-step summary lines | `src/optimizer/bpp/compress.rs` |
+| `placement_is_hopeless` — the cheap band+area prefilter | `src/optimizer/bpp/compress.rs` |
+| `widest_gap` — merged-interval widest free gap on one axis | `src/optimizer/bpp/compress.rs` |
+| Consolidation sweep over **every** bin, ascending density, `remaining / n_remaining` fair share | `src/optimizer/bpp/compress.rs` |
+| `layout_stats` split out of `report_stats` (stats without logging, for the sweep's re-derivation) | `src/optimizer/bpp/compress.rs` |
+| `PackDownStrategy::{Concentrate, Spread}` + `source_ascending` / `accepts_destination` | `src/config.rs` |
+| `pack_down_strategy`, `consolidation_min_time_per_bin` | `src/config.rs` (`BPCompressionConfig`) |
+| `--pack-down spread\|concentrate` (`PackDownStrategyArg` + `From`) | `src/util/bpp_io.rs`, `src/bpp_main.rs` |
+| `candidate_rotations` / `rotated_bbox` promoted to `pub(crate)` for prefilter reuse | `src/optimizer/bpp/shelf.rs` |
+| Tests: iso6 in-code instance, all-bins-as-source, `Spread` vs `Concentrate` | `tests/bpp_packdown_tests.rs` |
+
+Measured (`-e 15 -c 10 -s 42` on iso6/o90; `-e 10 -c 10 -s 0` on swim; `-e 30 -c 20 -s 42` on 112 parts):
+
+| Instance | Before | After |
+| --- | --- | --- |
+| `iso6` | 9 bins, **0 moves**, 3rd-densest bin 67.2 % @ 1814/1985, compression used 0.0 s | 9 bins, **8 moves**, 3rd-densest **52.7 % @ 1510**, dense bins 82.1/87.8 %, compression used 22 s |
+| `o90` | 12 bins, 57.13 %, 0 moves | 12 bins, 57.13 %, 0 moves (genuinely full; the extra budget finds nothing) |
+| `swim` | 4 bins, 62.12 %, min-bin 37.7 %, sparse bin 3195/3200 wide | 4 bins, 62.12 %, min-bin 37.7 %, sparse bin **1813**/3200 wide |
+| 112 parts | 4 bins, 70.72 %, min-bin 41.9 % @ 1308 | 4 bins, 70.72 %, min-bin 41.9 % @ 1308 (unchanged) |
+
+#### Phase 6 design decisions
+
+* **The prefilter needs two independent witnesses, not one.** The first implementation rejected an
+  (item, destination) pair whenever no *guaranteed-empty band* (a merged-projection gap spanning the
+  full container height or width) could host the item's slimmest rotation. That is unsound: real
+  free space can be an L-shape that no axis projection sees. Measured, it silently discarded 6 of 8
+  legal moves on `iso6` and left the target bin at 58.1 % instead of 52.7 %. The rejection now also
+  requires the destination to lack the item's *area*. A/B-tested against a build with the prefilter
+  disabled: identical results, which is the property a prefilter must have.
+* **Destinations must be *strictly* denser (resp. sparser).** This is what guarantees termination:
+  every accepted move goes downhill in one fixed direction, so two bins cannot pass an item back and
+  forth forever. Allowing equality would admit exactly that cycle.
+* **The consolidation sweep is capped at `1 - pack_down_time_ratio`.** Without it, round 1's sweep
+  consumed the entire compression budget and there was no round 2 — and round 2 is where the payoff
+  is, because round 1's pack-down runs *before* any band exists. Capping the sweep took `iso6` from
+  2 moves to 8.
+* **Bins that cannot benefit are skipped, not charged.** ≤ 1 item, or content already spanning the
+  full container width. The third case ("the strip run did not narrow it") is only detectable
+  afterwards and is reported as a failed attempt, which rolls back.
+* **`Spread` is a pure ordering reversal.** Both strategies share one code path; `source_ascending`
+  and `accepts_destination` are the only two places the direction appears. That keeps them provably
+  symmetric and means neither can develop behaviour the other lacks.
+* **Targets are re-derived by density *index*, not by `LayKey`.** A successful `write_back` closes
+  and re-opens the layout under a fresh key, so a key captured before the sweep would be stale.
+
+#### Phase 6 deviations from the task description
+
+* **The `Spread` test asserts on the density *range*, not the minimum bin density.** The task asked
+  for "min-bin density increases relative to Concentrate". On `iso6` that is not achievable and the
+  assertion would be permanently red: four of the nine bins hold a single 997 x 605 piece that fits
+  into no other bin in any rotation, so the minimum is pinned at 30.1 % whatever the strategy does.
+  What `Spread` provably changes — and what it exists for — is the *spread*: 30–57 % versus
+  `Concentrate`'s 30–88 %. The test asserts `range(Spread) < range(Concentrate)`.
+* **The cross-bin-move assertion reads the density vector rather than a listener.** A cross-bin move
+  is the only mechanism in the phase that can change any bin's density (intra-layout consolidation
+  relocates strictly within one bin), so a changed sorted density vector *is* the witness — no
+  listener plumbing or changed return type needed.
+* **`consolidation_min_time_per_bin` was added** (not named in the spec, but required by its
+  "min 1 s" wording) so the floor is configurable rather than hard-coded.
 
 ### Phase 5 — constructive alternative, diagnostics, stagnation stop
 

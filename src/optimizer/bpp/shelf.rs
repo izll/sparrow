@@ -427,7 +427,7 @@ fn along_cross(w: f32, h: f32, mode: Mode) -> (f32, f32) {
 /// two rectilinear ones (0° and 90°) — a bbox model cannot exploit an arbitrary angle — and
 /// [`RotationRange::None`] only 0°. The result is deduplicated and sorted so the caller's choice is
 /// deterministic.
-fn candidate_rotations(item: &Item) -> Vec<f32> {
+pub(crate) fn candidate_rotations(item: &Item) -> Vec<f32> {
     let mut rotations = match &item.allowed_rotation {
         RotationRange::None => vec![0.0],
         RotationRange::Continuous => vec![0.0, PI / 2.0],
@@ -439,7 +439,7 @@ fn candidate_rotations(item: &Item) -> Vec<f32> {
 }
 
 /// The bbox of `item.shape_cd` after applying `rotation` (no translation).
-fn rotated_bbox(item: &Item, rotation: f32) -> Rect {
+pub(crate) fn rotated_bbox(item: &Item, rotation: f32) -> Rect {
     if rotation == 0.0 {
         return item.shape_cd.bbox;
     }
