@@ -228,6 +228,20 @@ pub fn pack_down(
                 if term.kill() {
                     break 'outer;
                 }
+                // A `destinations` lista a BELSO ciklus ELOTT keszult, de egy
+                // sikeres athelyezes bezarhat egy tablat, a rollback pedig uj
+                // kulcsokkal allitja vissza az allapotot. Ezert MINDHAROM
+                // kulcsot ujra ellenorizni kell, kulonben a SlotMap
+                // indexeles "invalid SlotMap key used" panickal all le.
+                if !sep.prob.layouts.contains_key(src) {
+                    break;
+                }
+                if !sep.prob.layouts.contains_key(dst) {
+                    continue;
+                }
+                if !sep.prob.layouts[src].placed_items.contains_key(pk) {
+                    break;
+                }
                 let snapshot = sep.save();
                 let item_id = sep.prob.layouts[src].placed_items[pk].item_id;
 
