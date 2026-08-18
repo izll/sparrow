@@ -67,6 +67,11 @@ pub struct BppCli {
     #[arg(short = 's', long, help = "Fixed seed for the random number generator")]
     pub rng_seed: Option<u64>,
 
+    /// Minimum separation between items and between items and the bin edge (mm)
+    #[arg(long = "min-sep", value_name = "MM", help = "Minimum distance between items and between items and the bin edge (mm). \
+                Items are inflated and bins are deflated by half this value each. Overrides the SPARROW_MIN_SEP env var")]
+    pub min_item_separation: Option<f32>,
+
     /// Number of independent optimizations to run in parallel (different seeds), keeping the best final solution
     #[arg(short = 'p', long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..),
         help = "Run N independent optimizations in parallel (seed, seed+1, ...) within the same time limit and keep the best result. \

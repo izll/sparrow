@@ -35,11 +35,31 @@ pub struct MainCli {
     #[arg(short = 's', long, help = "Fixed seed for the random number generator")]
     pub rng_seed: Option<u64>,
 
+    /// Minimum separation between items and between items and the container edge (mm)
+    #[arg(long = "min-sep", value_name = "MM", help = "Minimum distance between items and between items and the container edge (mm). \
+                Items are inflated and the container is deflated by half this value each. Overrides the SPARROW_MIN_SEP env var")]
+    pub min_item_separation: Option<f32>,
+
     /// Number of independent optimizations to run in parallel (different seeds), keeping the best final solution
     #[arg(short = 'p', long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..),
         help = "Run N independent optimizations in parallel (seed, seed+1, ...) within the same time limit and keep the best result. \
                 Uses otherwise idle CPU cores; each run uses its own worker threads (see #workers in the log)")]
     pub parallel_runs: u64,
+}
+
+/// Environment variable read as a fallback for `--min-sep` (used by callers that cannot pass CLI flags).
+pub const MIN_SEP_ENV_VAR: &str = "SPARROW_MIN_SEP";
+
+/// Resolves the minimum item separation to use: CLI flag > `SPARROW_MIN_SEP` env var > config default.
+/// Non-positive values disable the separation. Both binaries (`sparrow`, `sparrow-bpp`) use this, so an identical
+/// input yields an identical fit/no-fit verdict regardless of the problem type.
+pub fn resolve_min_item_separation(cli_value: Option<f32>, config_default: Option<f32>) -> Option<f32> {
+    let env_value = std::env::var(MIN_SEP_ENV_VAR).ok().and_then(|v| v.trim().parse::<f32>().ok());
+    match cli_value.or(env_value) {
+        Some(v) if v > 0.0 => Some(v),
+        Some(_) => None,
+        None => config_default,
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]

@@ -128,11 +128,19 @@ cargo build --release --features only_final_svg
                                  compression phase give up faster too (halved pack-down per-move
                                  budget, halved pack-down iteration/strike limits)
 -s, --rng-seed <SEED>            Fixed seed for the random number generator
+    --min-sep <MM>               Minimum distance between items and between items and the bin edge (mm).
+                                 Overrides the SPARROW_MIN_SEP env var; default: none
 -p, --parallel-runs <N>          Run N independent optimizations in parallel (seeds seed..seed+N-1)
                                  and keep the best (default: 1)
     --bin <WxH[:stock[:cost]]>   Declare a rectangular bin type. Repeatable
 -h, --help                       Print help
 ```
+
+**Minimum separation semantics** (`--min-sep s`, identical for `sparrow` and `sparrow-bpp`): every item is inflated
+by `s/2` and every container (strip or bin) is deflated by `s/2`, i.e. items keep at least `s` from each other *and*
+from the bin edge. A 992 mm item therefore needs a bin of at least 992 + 2·(s/2) + 2·(s/2) = 1002 mm (+ ε) when
+`s = 5`. If a caller wants a different edge margin `m` than the item spacing `s`, it should shrink the bin by
+`2·(m − s)` (only when `m > s`) — not by `2·(m − s/2)`. `tests/fit_parity_tests.rs` pins the equal-verdict guarantee.
 
 `-t` is mutually exclusive with `-e`/`-c`, which must be given together. Pressing `Ctrl+C` moves the
 algorithm to the next phase, or terminates it.

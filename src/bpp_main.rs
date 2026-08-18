@@ -103,7 +103,14 @@ fn main() -> Result<()> {
 
     let (ext_instance, ext_solution) = bpp_io::read_bpp_input(Path::new(&input_file_path), &args.bins)?;
 
-    let importer = Importer::new(config.cde_config, config.poly_simpl_tolerance, config.min_item_separation, config.narrow_concavity_cutoff_ratio);
+    // Minimum item separation: --min-sep > SPARROW_MIN_SEP env var > config default (shared with the SPP binary,
+    // so both engines apply exactly the same inflation/deflation to identical inputs).
+    let min_sep = sparrow::util::io::resolve_min_item_separation(args.min_item_separation, config.min_item_separation);
+    config.min_item_separation = min_sep;
+    if let Some(sep) = min_sep {
+        info!("[MAIN] minimum item separation: {sep} (items inflated and bins deflated by {} each)", sep / 2.0);
+    }
+    let importer = Importer::new(config.cde_config, config.poly_simpl_tolerance, min_sep, config.narrow_concavity_cutoff_ratio);
     let instance = jagua_rs::probs::bpp::io::import_instance(&importer, &ext_instance)?;
 
     let initial_solution = match ext_solution {

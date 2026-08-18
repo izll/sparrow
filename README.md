@@ -61,6 +61,7 @@ Pressing 'Ctrl + C' immediately moves the algorithm to the next phase, or termin
 -c, --compression <COMPRESSION>  Set the compression phase time limit (in seconds)
 -x, --early-termination          Enable early termination of the optimization process
 -s, --rng-seed <RNG_SEED>        Fixed seed for the random number generator
+    --min-sep <MM>               Minimum distance between items and between items and the container edge (mm)
 -p, --parallel-runs <N>          Run N independent optimizations in parallel (seed, seed+1, ...) and keep the best (default: 1)
 -h, --help                       Print help
 ```

@@ -59,6 +59,10 @@ fn main() -> Result<()>{
     if let Some(arg_rng_seed) = args.rng_seed {
         config.rng_seed = Some(arg_rng_seed as usize);
     }
+    config.min_item_separation = io::resolve_min_item_separation(args.min_item_separation, config.min_item_separation);
+    if let Some(sep) = config.min_item_separation {
+        info!("[MAIN] minimum item separation: {sep} (items inflated and container deflated by {} each)", sep / 2.0);
+    }
 
     info!("[MAIN] configured to explore for {}s and compress for {}s", explore_dur.as_secs(), compress_dur.as_secs());
 
