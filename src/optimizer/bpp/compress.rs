@@ -224,6 +224,17 @@ pub fn pack_down(
                 .map(|(lkey, _)| lkey)
                 .collect_vec();
 
+            // Diagnostics for this source item: the bbox it has to fit somewhere, how many
+            // destinations were tried, and the lowest residual loss any of them left over. A
+            // residual loss well above zero everywhere is the signature of "the free area exists
+            // but is fragmented", which is what makes single-item transfers hopeless.
+            let src_item_id = sep.prob.layouts[src].placed_items[pk].item_id;
+            let src_bbox = sep.prob.layouts[src].placed_items[pk].shape.bbox;
+            let (src_w, src_h) = (src_bbox.width(), src_bbox.height());
+            let mut n_tried = 0usize;
+            let mut best_residual: Option<(f32, LayKey)> = None;
+            let mut moved_to: Option<LayKey> = None;
+
             for dst in destinations {
                 if term.kill() {
                     break 'outer;
@@ -244,6 +255,7 @@ pub fn pack_down(
                 }
                 let snapshot = sep.save();
                 let item_id = sep.prob.layouts[src].placed_items[pk].item_id;
+                n_tried += 1;
 
                 // 1. Move the item across at a random feasible position in `dst`.
                 let Some((new_pk, src_closed)) = sep.transfer_item(src, pk, dst) else {
@@ -272,6 +284,7 @@ pub fn pack_down(
                     best_sol = candidate;
                     n_moved += 1;
                     moved_this_pass = true;
+                    moved_to = Some(dst);
                     sol_listener.report(ReportType::CmprFeas, &best_sol, instance);
 
                     if src_closed {
@@ -281,11 +294,28 @@ pub fn pack_down(
                     break;
                 }
 
+                if best_residual.is_none_or(|(l, _)| total_loss < l) {
+                    best_residual = Some((total_loss, dst));
+                }
+
                 // Failed: restore the state from before this attempt and try the next destination.
                 let (sol, cts) = snapshot;
                 sep.rollback(&sol, Some(&cts));
                 debug!("[BPCMPR] item {item_id} does not fit into bin {dst:?} (loss {}), rolling back",
                     crate::FMT().fmt2(total_loss));
+            }
+
+            // One bounded info line per source item, whatever the outcome: this is the diagnostic
+            // that shows *why* a pack-down pass moves nothing.
+            let residual = match best_residual {
+                Some((l, dst)) => format!("{} (bin {dst:?})", crate::FMT().fmt2(l)),
+                None => "n/a (fits in no destination bbox)".to_string(),
+            };
+            match moved_to {
+                Some(dst) => info!("[BPCMPR] item {src_item_id} ({src_w:.0}x{src_h:.0} bbox) from bin {src:?}: \
+                                    tried {n_tried} bins, best residual loss {residual} -> moved to bin {dst:?}"),
+                None => info!("[BPCMPR] item {src_item_id} ({src_w:.0}x{src_h:.0} bbox) from bin {src:?}: \
+                               tried {n_tried} bins, best residual loss {residual} -> kept in place"),
             }
         }
 

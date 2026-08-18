@@ -4,6 +4,11 @@ use jagua_rs::io::svg::{SvgDrawOptions, SvgLayoutTheme};
 pub const GLS_WEIGHT_MAX_INC_RATIO: f32 = 2.0;
 pub const GLS_WEIGHT_MIN_INC_RATIO: f32 = 1.2;
 pub const GLS_WEIGHT_DECAY: f32 = 0.95;
+/// Upper bound for GLS weights. Weights of a persistently worst collision grow by up to `GLS_WEIGHT_MAX_INC_RATIO`
+/// per iteration; without a cap they overflow `f32` after ~128 such iterations (`inf`, then `NaN` weighted losses).
+/// This can happen with rigid layouts (e.g. axis-aligned rectangles) that cannot be separated at a given width.
+/// The cap is far above any weight reached in normal runs, so it does not change non-degenerate behaviour.
+pub const GLS_WEIGHT_MAX: f32 = 1e15;
 pub const OVERLAP_PROXY_EPSILON_DIAM_RATIO: f32 = 0.01;
 
 

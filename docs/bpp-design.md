@@ -32,7 +32,8 @@ Motivation and the full feasibility analysis (mapping tables, file:line referenc
 src/optimizer/bpp/mod.rs        optimize_bpp(): orchestration (LBF -> explore -> compress), BPPhase configs
 src/optimizer/bpp/separator.rs  BPSeparator: BPProblem + per-layout trackers + workers + thread pool
 src/optimizer/bpp/worker.rs     BPSeparatorWorker: move_items over all layouts (intra-layout moves)
-src/optimizer/bpp/lbf.rs        BPLBFBuilder: constructive first solution into bins
+src/optimizer/bpp/lbf.rs        BPLBFBuilder: constructive first solution into bins (sampling-based)
+src/optimizer/bpp/shelf.rs      BPShelfBuilder: deterministic bbox column/shelf constructor, Constructive
 src/optimizer/bpp/explore.rs    bin-count reduction loop (close least-filled bin -> scatter -> separate), disruption
 src/optimizer/bpp/compress.rs   remainder consolidation in the last bin (v1 may be a no-op that returns the input)
 src/util/bpp_io.rs              read ExtBPInstance / build one from ExtSPInstance + --bin WxH[:stock[:cost]],
@@ -40,6 +41,7 @@ src/util/bpp_io.rs              read ExtBPInstance / build one from ExtSPInstanc
 src/bpp_main.rs                 `sparrow-bpp` binary (clap), mirrors src/main.rs incl. -p parallel runs
 src/config.rs                   + BPConfig / BPExplorationConfig / BPCompressionConfig + DEFAULT_BPP_CONFIG
 tests/bpp_tests.rs              integration tests
+tests/bpp_shelf_tests.rs        shelf constructor tests (phase 5)
 docs/bpp.md                     user docs (CLI, JSON format, how the algorithm works)
 ```
 
@@ -158,10 +160,68 @@ back into that layout (offset by the container bbox origin) — only if the resu
 
 ## Status (2026-08-18)
 
-Phases 1–**4** are complete. `cargo test` is green (18 tests: 3 SPP integration + 15 BPP), `cargo
+Phases 1–**5** are complete. `cargo test` is green (18 tests: 3 SPP integration + 15 BPP), `cargo
 clippy --all-targets` is clean for all BPP files (the only two remaining warnings are pre-existing
 `collapsible_if`s in the SPP `separator.rs`), and `cargo build --release` (also with `--features
 only_final_svg`) succeeds.
+
+### Phase 5 — constructive alternative, diagnostics, stagnation stop
+
+The problem phase 5 was asked to solve: on the real `o90` part set (7 rectangles, all 600 wide,
+demand 7 each, `--bin 1990x995 --min-sep 5`) sparrow-bpp reported 12 bins while "a trivial shelf
+heuristic reaches 10", exploration never converged, and pack-down moved nothing without saying why.
+
+**The headline finding: 12 is optimal; the 10-bin figure is wrong.** It is computed on the raw
+600 x h / 1990 x 995 geometry, i.e. it silently drops the requested 5 mm separation. On the actual
+(inflated 605 x (h+5), deflated 1985 x 990) geometry, 12 is a *proven lower bound* — see
+`docs/bpp.md` for the derivation. Sketch: the 997 mm piece cannot stand in a 990 mm bin so it must
+lie down, exhaustive placement search shows no bin holds 4 "big" (≥ 513 mm) pieces and no bin
+containing the 997 piece holds two other big pieces; 7 bins are pinned by the 7 copies of it and
+absorb ≤ 7 more big pieces, leaving 14 at 3/bin = 5 bins → 12. So the pipeline was already optimal,
+the exploration was correctly failing to find an 11-bin packing, and pack-down was correctly
+rejecting every transfer. What was missing was the ability to *see* that.
+
+| Item | Where |
+| --- | --- |
+| `BPShelfBuilder` — deterministic bbox column/shelf (FFDH) constructor, both modes, verified | `src/optimizer/bpp/shelf.rs` |
+| `Constructive::{Best, Lbf, Shelf}` + `BPConfig::constructive` (default `Best`) | `src/optimizer/bpp/shelf.rs`, `src/config.rs` |
+| `build_initial_problem` — builds both constructors, logs both, starts from the better | `src/optimizer/bpp/mod.rs` |
+| `stagnation_limit` (default `Some(8)`) + `STAGNATION_MIN_IMPROVEMENT` (2 %) | `src/config.rs`, `src/optimizer/bpp/explore.rs` |
+| Per-attempt exploration diagnostics + one-line stop reason | `src/optimizer/bpp/explore.rs` |
+| Per-item pack-down diagnostics (bbox, bins tried, best residual loss, outcome) | `src/optimizer/bpp/compress.rs` |
+| Shelf probe in the CLI; `-x` also halves `stagnation_limit` | `src/bpp_main.rs` |
+| Tests: shelf feasible/≤12 bins on o90, pipeline not worse than the shelf, swim collision-free, determinism | `tests/bpp_shelf_tests.rs` |
+
+Measured (`-e 15 -c 10 -s 42` on o90; `-e 30 -c 20 -s 42` on the others):
+
+| Instance | Before | After |
+| --- | --- | --- |
+| `o90` | 12 bins, 18.0 s, exploration ran the full budget | 12 bins (**optimal**), **6.5 s**, exploration stops at 3.4 s (`stagnation`) |
+| `swim`, `--bin 3200x3200` | 4 bins | 4 bins (shelf 7 vs LBF 5 → `Best` keeps LBF) |
+| 112 parts, `--bin 2000x1000` | 4 bins, least dense 41.9 % | 4 bins, least dense 41.9 % (shelf 5 = LBF 5 → LBF wins on min-bin density) |
+
+#### Phase 5 design decisions
+
+* **Block/column transfer: deliberately NOT implemented.** The task made it conditional on
+  measurement ("only if needed"). On `o90` single-item pack-down moves nothing because there is no
+  11-bin packing to find at all — a group transfer would spend the budget re-deriving the same
+  rejection with bigger objects. On the 112-part case, where free space genuinely *is* fragmented,
+  single-item pack-down already moves 10 items and drops the least dense bin to 41.9 %. The hook
+  (`BPSeparator::transfer_item` + `report_stats`' per-bin free width) stays open and is documented in
+  `docs/bpp.md`.
+* **`PLACEMENT_GAP` (1e-3) in the shelf builder.** jagua-rs treats *touching* shapes as colliding,
+  and a perfect shelf packing produces exactly-touching bboxes. The builder's own
+  `Layout::is_feasible()` verification caught this immediately — which is the argument for having
+  made the verification an `Err` rather than a debug assertion.
+* **The shelf builder fails soft under `Constructive::Best`.** Its error is logged and the LBF result
+  is used; it is only fatal under `Constructive::Shelf`. A bbox model can legitimately reject an item
+  whose *contour* fits, so it must not be able to sink a run.
+* **Orientation rule: maximise the along-axis extent that still fits.** For a rectangle that means
+  "stand it up" in column mode. The alternatives (minimise width, keep the natural orientation) were
+  prototyped and all lay the parts down, destroying the column structure.
+* **Diagnostics are info-level and bounded.** `release_max_level_info` compiles `debug!` out of
+  release builds entirely, so `RUST_LOG=debug` can never show them; a `--profile debug-release` build
+  can, but the `debug_assert!`s make it far too slow for a production run. Documented in `docs/bpp.md`.
 
 ### Phase 4 — cross-layout consolidation ("pack-down")
 

@@ -10,7 +10,8 @@
 //! tracker per open layout** and the "total loss" is the sum over all of them.
 //!
 //! The pipeline consists of:
-//! * [`lbf::BPLBFBuilder`] — constructive first solution,
+//! * [`lbf::BPLBFBuilder`] — constructive first solution (sampling-based, good for irregular parts),
+//! * [`shelf::BPShelfBuilder`] — deterministic bbox column/shelf constructor (good for rectangles),
 //! * [`separator::BPSeparator`] — the separation loop (SPP Algorithm 9 over all layouts),
 //! * [`worker::BPSeparatorWorker`] — the parallel move workers (SPP Algorithm 5 per layout),
 //! * [`explore::exploration_phase`] — the bin-count reduction loop (primary objective),
@@ -21,12 +22,15 @@ pub mod compress;
 pub mod explore;
 pub mod lbf;
 pub mod separator;
+pub mod shelf;
 pub mod worker;
 
 #[doc(inline)]
 pub use lbf::BPLBFBuilder;
 #[doc(inline)]
 pub use separator::{BPSeparator, BPSnapshot};
+#[doc(inline)]
+pub use shelf::{BPShelfBuilder, Constructive};
 #[doc(inline)]
 pub use worker::BPSeparatorWorker;
 
@@ -38,8 +42,10 @@ use crate::util::bpp_io::BPSolutionListener;
 use crate::util::listener::ReportType;
 use crate::util::terminator::Terminator;
 use jagua_rs::Instant;
+use jagua_rs::entities::Instance;
 use jagua_rs::probs::bpp::entities::{BPInstance, BPProblem, BPSolution};
 use log::info;
+use ordered_float::OrderedFloat;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{Rng, RngExt, SeedableRng};
 
@@ -71,14 +77,8 @@ pub fn optimize_bpp(
 
     // --- 1. Initial solution -----------------------------------------------------------------
     let start_prob = match initial_solution {
-        None => {
-            let builder = BPLBFBuilder::new(instance.clone(), next_rng(), LBF_SAMPLE_CONFIG)
-                .construct()
-                .expect("[BPOPT] failed to construct an initial solution");
-            info!("[BPOPT] LBF start: {} bin(s), cost: {}, dens: {:.3}%",
-                builder.prob.layouts.len(), builder.prob.bin_cost(), builder.prob.density() * 100.0);
-            builder.prob
-        }
+        None => build_initial_problem(&instance, next_rng(), config.constructive)
+            .expect("[BPOPT] failed to construct an initial solution"),
         Some(init_sol) => {
             info!("[BPOPT] warm starting from provided initial solution");
             let mut prob = BPProblem::new(instance.clone());
@@ -141,4 +141,82 @@ pub fn optimize_bpp(
     sol_listener.report(ReportType::Final, &cmpr_sol, &instance);
 
     cmpr_sol
+}
+
+/// Builds the starting [`BPProblem`] with the configured constructive heuristic.
+///
+/// With [`Constructive::Best`] (the default) **both** constructors are run and the better result is
+/// kept. "Better" is: fewer bins first, then the lower density of the least dense bin (the slack is
+/// more concentrated, which is what the compression phase can exploit), and finally LBF — it is the
+/// historical default, so a genuine tie must not change existing behaviour.
+///
+/// The two heuristics are complementary rather than redundant: [`BPLBFBuilder`] samples real
+/// contours (so it nests irregular parts), [`BPShelfBuilder`] reasons about bounding boxes (so it
+/// finds the guillotine structure a rectangular part set wants). Running both costs milliseconds
+/// and removes the need to guess which family an instance belongs to.
+///
+/// Both results are logged, so the choice is always visible in the log.
+pub fn build_initial_problem(
+    instance: &BPInstance,
+    rng: Xoshiro256PlusPlus,
+    constructive: Constructive,
+) -> anyhow::Result<BPProblem> {
+    /// Bins, and the density of the least dense bin, of a candidate problem.
+    fn stats(prob: &BPProblem, instance: &BPInstance) -> (usize, f32) {
+        let min_dens = prob.layouts.values()
+            .map(|l| l.density(instance))
+            .fold(f32::INFINITY, f32::min);
+        (prob.layouts.len(), min_dens)
+    }
+
+    let lbf = match constructive {
+        Constructive::Shelf => None,
+        _ => Some(BPLBFBuilder::new(instance.clone(), rng, LBF_SAMPLE_CONFIG).construct()?.prob),
+    };
+    let shelf = match constructive {
+        Constructive::Lbf => None,
+        // A failing shelf constructor must not sink a run that the LBF could have handled (e.g. an
+        // item whose bbox fits in no bin although its contour does), so its error is only fatal
+        // when it is the only candidate.
+        _ => match BPShelfBuilder::new(instance.clone()).construct() {
+            Ok(b) => Some(b.prob),
+            Err(e) if constructive == Constructive::Shelf => return Err(e),
+            Err(e) => {
+                info!("[BPOPT] shelf constructor failed ({e}), falling back to LBF");
+                None
+            }
+        },
+    };
+
+    match (lbf, shelf) {
+        (Some(lbf), Some(shelf)) => {
+            let (lbf_bins, lbf_dens) = stats(&lbf, instance);
+            let (shelf_bins, shelf_dens) = stats(&shelf, instance);
+            info!("[BPOPT] LBF start: {lbf_bins} bin(s), min-bin dens {:.3}% | shelf start: {shelf_bins} bin(s), min-bin dens {:.3}%",
+                lbf_dens * 100.0, shelf_dens * 100.0);
+            // Strictly better = fewer bins, or the same count with a sparser emptiest bin.
+            let shelf_wins = (shelf_bins, OrderedFloat(shelf_dens)) < (lbf_bins, OrderedFloat(lbf_dens));
+            match shelf_wins {
+                true => {
+                    info!("[BPOPT] starting from the shelf solution ({shelf_bins} bin(s))");
+                    Ok(shelf)
+                }
+                false => {
+                    info!("[BPOPT] starting from the LBF solution ({lbf_bins} bin(s))");
+                    Ok(lbf)
+                }
+            }
+        }
+        (Some(lbf), None) => {
+            let (bins, dens) = stats(&lbf, instance);
+            info!("[BPOPT] LBF start: {bins} bin(s), min-bin dens {:.3}%", dens * 100.0);
+            Ok(lbf)
+        }
+        (None, Some(shelf)) => {
+            let (bins, dens) = stats(&shelf, instance);
+            info!("[BPOPT] shelf start: {bins} bin(s), min-bin dens {:.3}%", dens * 100.0);
+            Ok(shelf)
+        }
+        (None, None) => unreachable!("at least one constructor runs for every `Constructive` value"),
+    }
 }

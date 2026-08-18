@@ -170,7 +170,8 @@ biggest usable offcut) wins, rather than the one that spreads the same slack eve
 
 ```
                     ┌──────────────────────────────────────────────┐
-   instance ──────► │ 1. LBF construction        (bpp/lbf.rs)      │
+   instance ──────► │ 1. Construction: LBF (bpp/lbf.rs) AND        │
+                    │    shelf (bpp/shelf.rs) → start from the best│
                     └──────────────────┬───────────────────────────┘
                                        │ feasible start solution
                     ┌──────────────────▼───────────────────────────┐
@@ -178,7 +179,8 @@ biggest usable offcut) wins, rather than the one that spreads the same slack eve
                     │    repeat:                                   │
                     │      close least-dense bin & scatter items   │
                     │      separate (GLS)   (bpp/separator.rs)     │
-                    │      area bound? → stop, hand time to (3)    │
+                    │      area bound / stagnation? → stop,        │
+                    │        hand the rest of the time to (3)      │
                     │      feasible?   → accept (one bin fewer)    │
                     │      else        → roll back to best+disrupt │
                     └──────────────────┬───────────────────────────┘
@@ -193,7 +195,56 @@ biggest usable offcut) wins, rather than the one that spreads the same slack eve
                                        ▼  final solution
 ```
 
-### 1. LBF construction (`bpp/lbf.rs`)
+### 1. Construction — two heuristics, better one wins (`bpp/lbf.rs`, `bpp/shelf.rs`)
+
+Two *complementary* constructors are built and the better result seeds the pipeline (fewer bins;
+tie → lower density of the least dense bin; tie → LBF). Both results are always logged:
+
+```
+[BPOPT] LBF start: 5 bin(s), min-bin dens 0.564% | shelf start: 5 bin(s), min-bin dens 36.511%
+[BPOPT] starting from the LBF solution (5 bin(s))
+```
+
+Controlled by `BPConfig::constructive` (`Constructive::{Best, Lbf, Shelf}`, default `Best`). A warm
+start (`initial_solution`) bypasses both.
+
+#### 1b. Shelf/column construction (`bpp/shelf.rs`)
+
+`BPShelfBuilder` ignores the contours and packs the items' **bounding boxes**. It works on
+`item.shape_cd.bbox` (already inflated by `min_item_separation`) inside `container.outer_cd.bbox`
+(already deflated by the same amount), so a placement that is collision-free in the bbox model is
+collision-free in the real geometry *with the requested separation respected*.
+
+It runs two first-fit-decreasing variants and keeps the better one:
+
+* **column mode** — vertical stacks packed left → right; a new column starts when the item no longer
+  fits on top of an open one,
+* **shelf/row mode** — the transpose (horizontal shelves packed bottom → top).
+
+Items are sorted by their along-axis extent (descending, ties: cross extent, then id) after choosing
+per item the orientation with the largest along-axis extent that still fits — for a rectangle that
+means "stand it up" in column mode. Candidate rotations come from `RotationRange::Discrete`; a
+`Continuous` item is only tried at 0° and 90°, since a bbox model cannot exploit an arbitrary angle.
+
+There is **no RNG anywhere** in this constructor: every ordering is a total order, so two builds
+produce identical placements (tested).
+
+Two details that matter:
+
+* **`PLACEMENT_GAP` (1e-3).** jagua-rs treats *touching* shapes as colliding, and a perfect shelf
+  packing produces exactly-touching bboxes. Every item is therefore inset by this much on both axes.
+  It is orders of magnitude below the `min_item_separation` the geometry already carries.
+* **Verification.** After materialising the packing, every layout is checked with
+  `Layout::is_feasible()` and the demand is checked for completeness. A failure is a *bug in the bbox
+  arithmetic*, never a property of the input, so it is an `Err` rather than a silent repair. Under
+  `Constructive::Best` a failing shelf build is logged and the LBF result is used instead.
+
+When it helps and when it does not: on rectangular part sets the bbox model *is* the geometry, so the
+column structure it finds is what such an instance wants. On irregular parts it throws away
+everything the contour would have saved — on `swim` it needs 7 bins where the LBF needs 5. That is
+precisely why both are built and the better one wins.
+
+### 1a. LBF construction (`bpp/lbf.rs`)
 
 Items are sorted exactly as in the SPP builder — convex hull area × diameter, descending, expanded by
 demand — and placed one at a time, left-bottom-first. Each item is first tried in the already open
@@ -247,6 +298,26 @@ so better pooled attempts lead to gentler disruption.
 The loop stops when the terminator fires, when `max_conseq_failed_attempts` consecutive attempts have
 failed (`-x`), or when a single bin is left.
 
+**Phase-wise stagnation stop.** The area bound catches reductions that are *area*-impossible. A
+reduction can also be impossible for purely geometric reasons the area bound cannot see (the free
+space exists but is fragmented). The symptom is an attempt series whose min loss oscillates around
+the same value instead of trending down. `stagnation_limit` (default `Some(8)`, `-x` halves it)
+stops exploration when that many consecutive attempts fail *and* none of them improved the best min
+loss seen at the current bin count by at least `STAGNATION_MIN_IMPROVEMENT` (2 %). The remaining
+budget is handed to the compression phase, which is the same mechanism the area bound already uses.
+
+Each failed attempt now logs the state that decision is based on:
+
+```
+[BPEXPL] unable to reach feasibility with 11 bin(s) (dens: 62.323%, min loss: 223 K,
+         best at this level: 161 K, 0.3s, strikes left: inf, stagnant: 1/8)
+[BPEXPL] stagnated: 8 attempt(s) without a >2% improvement of the min loss (161 K) at 11 bin(s),
+         handing the rest of the budget to compression
+```
+
+and the phase ends with a one-line reason: `finished (stagnation | area bound | strikes exhausted |
+time limit | single bin | could not close a bin), best feasible solution: …`.
+
 ### 3. Compression — remainder consolidation (`bpp/compress.rs`)
 
 The bin count is settled; now make the leftover material reusable. Two steps alternate until the
@@ -288,6 +359,28 @@ The step uses its own, deliberately cheap separator (`pack_down_separator_config
 are made, and each attempt is capped at `pack_down_move_time_limit` (2 s). Pack-down as a whole may
 use `pack_down_time_ratio` (60 %) of the remaining compression budget; the rest is reserved for 3b.
 
+**Per-item diagnostics.** Every source item produces exactly one info line, whatever the outcome:
+
+```
+[BPCMPR] item 6 (513x605 bbox) from bin LayKey(10v17): tried 11 bins,
+         best residual loss 64.8 K (bin LayKey(11v19)) -> kept in place
+```
+
+`best residual loss` is the lowest collision loss any destination was left with after the short
+`separate()`. A value far above zero for *every* destination is the signature of "the free area is
+real but fragmented" — the transfer is being rejected legitimately, not for lack of budget.
+
+**Block/column transfer: not implemented, deliberately.** The plan was to fall back to moving whole
+columns when single-item transfers move nothing. Measurement says that would not help on the case
+that motivated it. On `o90` with `--min-sep 5` the pack-down step genuinely cannot move anything,
+because **12 bins is a proven lower bound** for that instance (see *Measured results*): the slack is
+not merely fragmented, there is no 11-bin packing to find at all. A group transfer would spend the
+budget re-deriving the same rejection with bigger objects. On the instances where free space *is*
+merely fragmented (the 112-part case) single-item pack-down already moves 10 items and drops the
+least dense bin from 65.9 % to 41.9 %. The hook stays open: `BPSeparator::transfer_item` is the
+primitive a group version would loop over, and `report_stats` already exposes the per-bin free-width
+information such a step needs.
+
 #### 3b. Strip consolidation — intra-layout (`consolidate_layout`)
 
 The **least dense** bin (recomputed: pack-down may have changed which one that is) is lifted into a
@@ -307,6 +400,12 @@ is a no-op that only reports the per-bin statistics.
 
 All defaults live in `DEFAULT_BPP_CONFIG` (`src/config.rs`).
 
+### `BPConfig`
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `constructive` | `Constructive::Best` | Which constructor seeds the pipeline. `Best` builds both (LBF and shelf) and starts from the better one; `Lbf` / `Shelf` force one. |
+
 ### `BPExplorationConfig`
 
 | Field | Default | Meaning |
@@ -314,6 +413,7 @@ All defaults live in `DEFAULT_BPP_CONFIG` (`src/config.rs`).
 | `time_limit` | 9 min (CLI overrides) | Wall-clock budget for the exploration phase. Unused time goes to compression. |
 | `max_reduction_density` | `0.90` | **Area bound.** Skip (and return from) the exploration when reducing to `n-1` bins would need a higher density than this. `1.0` = pure area bound. |
 | `max_conseq_failed_attempts` | `None` (`-x` → 10) | Give up after this many consecutive failed reductions. |
+| `stagnation_limit` | `Some(8)` (`-x` → 4) | Stop when this many consecutive attempts fail **and** the best min loss at the current bin count has not improved by ≥ 2 %. |
 | `n_scatter_retries` | `3` | Consecutive failed attempts target the 1st, 2nd, … least dense bin. |
 | `separator_config` | 200 iters / 3 strikes | The GLS separation loop used for a reduction attempt. |
 | `solution_pool_distribution_stddev` | `0.25` | Half-normal spread when picking a pooled attempt (sets the disruption strength). |
@@ -333,6 +433,32 @@ All defaults live in `DEFAULT_BPP_CONFIG` (`src/config.rs`).
 | `separator_config` | 100 iters / 5 strikes | Separator the phase is constructed with (restored around each pack-down round). |
 
 ---
+
+## Logging and diagnostics
+
+**`debug!` does not exist in a release build.** `Cargo.toml` enables the `log` crate's
+`release_max_level_info` feature, which compiles every `debug!`/`trace!` call *out at compile time*
+for release profiles. So on a normal `cargo build --release` binary:
+
+* `RUST_LOG=debug` can **never** show a `debug!` line — the call site is gone, not filtered,
+* the same holds for `LOG_LEVEL_FILTER_DEBUG`; only `info!` and above survive.
+
+To actually see `debug!` output you need a build with debug assertions
+(`cargo build --profile debug-release` or a plain debug build), which is far slower — the
+`debug_assert!`s in the separator and the trackers dominate the runtime. That is why every diagnostic
+that has to be usable on a production run is emitted at **info** level and kept *bounded* (one line
+per pack-down source item, one per exploration attempt, one summary per phase) rather than per
+iteration.
+
+The info-level diagnostics added for this:
+
+| Prefix | Line | Where |
+| --- | --- | --- |
+| `[BPOPT]` | `LBF start: … \| shelf start: …` + which one is used | `bpp/mod.rs` |
+| `[BPSHELF]` | which mode won, and the final bin count / density | `bpp/shelf.rs` |
+| `[BPEXPL]` | per attempt: min loss, best-at-this-level, duration, strikes left, stagnation counter | `bpp/explore.rs` |
+| `[BPEXPL]` | `finished (<reason>)` — time limit / strikes exhausted / stagnation / area bound / single bin | `bpp/explore.rs` |
+| `[BPCMPR]` | per pack-down source item: bbox, bins tried, best residual loss, moved or kept | `bpp/compress.rs` |
 
 ## Determinism
 
@@ -372,10 +498,56 @@ density cannot improve either, so the only thing left to optimise is **where** t
 moves it out of three bins into one, turning the 112-part result from "four bins each with a sliver of
 waste" into "three nearly full bins plus a 692 x 1000 clean offcut".
 
+### The `o90` case — why 12 bins is the answer, not 10
+
+`o90` is 7 rectangle types (all 600 wide, heights 992/540/102/96/102/892/508), demand 7 each = 49
+items, all four orientations allowed, into 1990 x 995 bins with `--min-sep 5`.
+
+| Metric | Before phase 5 | After phase 5 |
+| --- | --- | --- |
+| Bins | 12 (57.13 % density) | 12 (57.13 % density) |
+| LBF / shelf start | 12 (LBF only) | 12 / 12 — tie, `Best` keeps LBF |
+| Exploration | ran the full 15 s, min loss oscillating 160–270 K | **stops after 3.4 s** (`stagnation`) |
+| Pack-down moves | 0 (no reason logged) | 0 (**one diagnostic line per item**, best residual loss 64.8–85.9 K) |
+| Wall clock (`-e 15 -c 10`) | 18.0 s | **6.5 s** |
+
+**12 is a proven lower bound for this instance**, so the pipeline was already optimal and the
+"trivial shelf heuristic reaches 10" claim does not hold once `--min-sep 5` is taken into account:
+
+* With `--min-sep 5` every item is inflated to 605 x (h+5) and the bin deflated to 1985 x 990. A
+  first-fit-decreasing packer on that geometry needs **12** bins; the same packer on the *raw*
+  600 x h / 1990 x 995 geometry needs **10**. The 10-bin figure silently drops the requested 5 mm
+  separation — it is not a valid solution to the problem as posed.
+* Call a piece "big" if it is ≥ 513 mm in one dimension: that is items 0, 5, 1, 6 = 28 pieces.
+  Exhaustive placement search shows **no bin can hold 4 big pieces**, so ⌈28/3⌉ = 10 is a first bound.
+* Item 0 (997 mm inflated) does **not** fit upright in a 990 mm bin, so it must lie down as
+  997 x 605. Exhaustive search over all triples shows that **no bin containing item 0 can hold two
+  other big pieces** — it admits at most one. The 7 copies of item 0 therefore occupy 7 bins and
+  absorb at most 7 of the remaining 21 big pieces; the other 14 need ⌈14/3⌉ = 5 further bins.
+  **7 + 5 = 12.**
+
+So the remaining "gap" to the 6.86 → 7 area bound is **not** a nesting deficiency: it is forced by
+the piece geometry plus the requested separation. The area bound ignores that a 997 mm piece cannot
+stand in a 990 mm bin, and that is worth ~5 bins here. Answering the original question (4): after
+this phase o90 is **12 bins, which is optimal**; pushing below 12 is impossible at `--min-sep 5`, and
+reaching 10 requires giving up the separation (`--min-sep 0`).
+
 Both instances also demonstrate the area bound: exploration now returns in **< 0.1 s** instead of
 burning its full 30 s on provably impossible 4 → 3 (resp. 2 → 1) attempts, and `optimize_bpp` hands
 that time to the compression phase (`[BPOPT] exploration returned 30.0s before its deadline, handing
 that time to compression (20.0s -> 50.0s)`).
+
+### Phase 5 regression check (the shelf seed must not hurt the irregular cases)
+
+| Instance | Shelf start | LBF start | Chosen | Final |
+| --- | --- | --- | --- | --- |
+| `o90`, `--bin 1990x995:25:1 --min-sep 5`, `-e 15 -c 10 -s 42` | 12 bins | 12 bins | LBF (tie) | **12 bins**, 57.13 % |
+| `swim.json`, `--bin 3200x3200`, `-e 30 -c 20 -s 42` | 7 bins | **5 bins** | LBF | **4 bins**, 62.12 % |
+| 112 parts, `--bin 2000x1000`, `-e 30 -c 20 -s 42` | 5 bins | 5 bins (min-bin 0.56 %) | LBF (lower min-bin density) | **4 bins**, 70.72 %, least dense bin 41.9 % |
+
+On the two irregular instances the shelf constructor is worse or equal and `Constructive::Best`
+discards it — which is exactly the intended behaviour, and confirms the seed change cannot regress
+them.
 
 ## Known limitations
 
@@ -440,7 +612,8 @@ optimising for a target offcut size, plugs in there.
 | File | Role |
 | --- | --- |
 | `src/optimizer/bpp/mod.rs` | `optimize_bpp()` — orchestration (LBF → explore → compress) |
-| `src/optimizer/bpp/lbf.rs` | `BPLBFBuilder` — constructive first solution |
+| `src/optimizer/bpp/lbf.rs` | `BPLBFBuilder` — sampling-based constructive first solution |
+| `src/optimizer/bpp/shelf.rs` | `BPShelfBuilder` — deterministic bbox column/shelf constructor, `Constructive` |
 | `src/optimizer/bpp/separator.rs` | `BPSeparator` — separation loop, per-layout trackers, `close_bin_and_scatter`, `transfer_item` |
 | `src/optimizer/bpp/worker.rs` | `BPSeparatorWorker` — parallel move workers, `clamp_to_container` |
 | `src/optimizer/bpp/explore.rs` | Bin-count reduction loop, area bound (`required_density_for_reduction`) + disruption |

@@ -18,7 +18,7 @@ use rand::rngs::Xoshiro256PlusPlus;
 use rand::SeedableRng;
 use sparrow::config::{BPConfig, DEFAULT_BPP_CONFIG};
 use sparrow::consts::{DEFAULT_COMPRESS_TIME_RATIO, DEFAULT_EXPLORE_TIME_RATIO, DEFAULT_MAX_CONSEQ_FAILS_EXPL, LBF_SAMPLE_CONFIG, LOG_LEVEL_FILTER_DEBUG, LOG_LEVEL_FILTER_RELEASE};
-use sparrow::optimizer::bpp::{optimize_bpp, BPLBFBuilder};
+use sparrow::optimizer::bpp::{optimize_bpp, BPLBFBuilder, BPShelfBuilder};
 use sparrow::util::bpp_io::{self, BPSolutionListener, BPSvgExporter, BppCli, ExtBPOutput};
 use sparrow::util::ctrlc_terminator::CtrlCTerminator;
 use sparrow::util::io;
@@ -64,6 +64,9 @@ fn main() -> Result<()> {
     config.cmpr_cfg.time_limit = compress_dur;
     if args.early_termination {
         config.expl_cfg.max_conseq_failed_attempts = Some(DEFAULT_MAX_CONSEQ_FAILS_EXPL);
+        // Halve the stagnation limit too: `-x` means "give up early", and the stagnation stop is
+        // the finer-grained of the two give-up rules.
+        config.expl_cfg.stagnation_limit = config.expl_cfg.stagnation_limit.map(|n| (n / 2).max(1));
         // Also make the compression phase give up faster: halve the per-move budget of the
         // pack-down step and cut its separator's iteration/strike limits.
         config.cmpr_cfg.pack_down_move_time_limit /= 2;
@@ -156,6 +159,13 @@ fn main() -> Result<()> {
             .context("the instance cannot be packed: no initial solution could be constructed")?;
         info!("[MAIN] LBF probe: {} bin(s), cost: {}, density: {:.3}%",
             probe.prob.layouts.len(), probe.prob.bin_cost(), probe.prob.density() * 100.0);
+        // The shelf constructor is only a *candidate* (see `Constructive::Best`), so a failure here
+        // is informational: `optimize_bpp` falls back to the LBF solution it just validated.
+        match BPShelfBuilder::new(instance.clone()).construct() {
+            Ok(shelf) => info!("[MAIN] shelf probe: {} bin(s), cost: {}, density: {:.3}%",
+                shelf.prob.layouts.len(), shelf.prob.bin_cost(), shelf.prob.density() * 100.0),
+            Err(e) => warn!("[MAIN] shelf probe failed: {e}"),
+        }
     }
 
     // Set up the Ctrl-C handler once (before spawning any runs); CtrlCTerminator is multi-instance safe.

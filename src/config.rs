@@ -2,6 +2,7 @@ use crate::optimizer::separator::SeparatorConfig;
 use crate::sample::search::SampleConfig;
 use jagua_rs::collision_detection::CDEConfig;
 use jagua_rs::geometry::fail_fast::SPSurrogateConfig;
+use crate::optimizer::bpp::shelf::Constructive;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
@@ -113,6 +114,8 @@ pub const DEFAULT_SPARROW_CONFIG: SparrowConfig = SparrowConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct BPConfig {
     pub rng_seed: Option<usize>,
+    /// Which constructive heuristic builds the starting solution. See [`Constructive`].
+    pub constructive: Constructive,
     pub expl_cfg: BPExplorationConfig,
     pub cmpr_cfg: BPCompressionConfig,
     /// Configuration for the collision detection engine. See [`CDEConfig`].
@@ -157,7 +160,20 @@ pub struct BPExplorationConfig {
     /// * `0.90` (default) = also skip reductions that would need a nesting density above 90 %,
     ///   which is out of reach for irregular parts in practice.
     pub max_reduction_density: f32,
+    /// **Phase-wise stagnation stop.** If this many consecutive attempts at the *current* bin count
+    /// fail without the best min-loss seen at that level improving by at least
+    /// [`STAGNATION_MIN_IMPROVEMENT`], the exploration phase gives up early and hands its remaining
+    /// budget to the compression phase.
+    ///
+    /// This is strictly finer-grained than `max_conseq_failed_attempts`: that one only counts
+    /// failures, this one also looks at whether those failures are *getting anywhere*. A run that
+    /// keeps lowering its min loss is making progress and is left alone; one whose loss oscillates
+    /// around the same value never will. Disabled if `None`.
+    pub stagnation_limit: Option<usize>,
 }
+
+/// Relative improvement in the best min-loss that counts as "progress" for the stagnation stop.
+pub const STAGNATION_MIN_IMPROVEMENT: f32 = 0.02;
 
 /// Configuration of the BPP compression phase ([`crate::optimizer::bpp::compress::compression_phase`]).
 #[derive(Debug, Clone, Copy)]
@@ -194,6 +210,7 @@ pub struct BPCompressionConfig {
 /// settings, only the phase-specific knobs differ.
 pub const DEFAULT_BPP_CONFIG: BPConfig = BPConfig {
     rng_seed: None,
+    constructive: Constructive::Best,
     expl_cfg: BPExplorationConfig {
         time_limit: Duration::from_secs(9 * 60),
         max_conseq_failed_attempts: None,
@@ -202,6 +219,7 @@ pub const DEFAULT_BPP_CONFIG: BPConfig = BPConfig {
         large_item_ch_area_cutoff_percentile: 0.75,
         n_scatter_retries: 3,
         max_reduction_density: 0.90,
+        stagnation_limit: Some(8),
     },
     cmpr_cfg: BPCompressionConfig {
         time_limit: Duration::from_secs(60),

@@ -15,7 +15,7 @@
 //! before retrying, exactly like the SPP version does.
 
 use crate::FMT;
-use crate::config::BPExplorationConfig;
+use crate::config::{BPExplorationConfig, STAGNATION_MIN_IMPROVEMENT};
 use crate::optimizer::bpp::separator::BPSeparator;
 use crate::optimizer::bpp::worker::clamp_to_container;
 use crate::util::bpp_io::BPSolutionListener;
@@ -24,6 +24,7 @@ use crate::sample::uniform_sampler::convert_sample_to_closest_feasible;
 use crate::util::terminator::Terminator;
 use float_cmp::approx_eq;
 use itertools::Itertools;
+use jagua_rs::Instant;
 use jagua_rs::collision_detection::hazards::HazardEntity;
 use jagua_rs::entities::{Instance, Layout, PItemKey};
 use jagua_rs::geometry::geo_traits::CollidesWith;
@@ -65,12 +66,21 @@ pub fn exploration_phase(
     let mut infeas_sol_pool: Vec<(BPSolution, f32)> = vec![];
     // How many attempts in a row have failed; also selects which bin is targeted next.
     let mut n_failed_attempts = 0usize;
+    // --- Stagnation tracking, per bin-count level ---------------------------------------------
+    // `best_level_loss` is the lowest total loss any attempt at the *current* bin count reached;
+    // `n_stagnant` counts the consecutive failures since it last improved meaningfully. Both reset
+    // whenever the bin count changes (a new level is a new subproblem).
+    let mut best_level_loss = f32::INFINITY;
+    let mut n_stagnant = 0usize;
+    // Why the loop stopped, for the one-line summary at the end.
+    let mut stop_reason = "time limit";
 
     while !term.kill() {
         if sep.prob.layouts.len() < 2 {
             // A single bin cannot be eliminated (there would be nowhere to scatter its items to),
             // and it is trivially the optimum for the bin-count objective.
             info!("[BPEXPL] only one bin left, nothing to reduce");
+            stop_reason = "single bin";
             break;
         }
 
@@ -82,6 +92,7 @@ pub fn exploration_phase(
         if required_density > config.max_reduction_density {
             info!("[BPEXPL] reduction to {} bins needs {:.1}% density > cap, skipping exploration",
                 sep.prob.layouts.len() - 1, required_density * 100.0);
+            stop_reason = "area bound";
             break;
         }
 
@@ -100,12 +111,15 @@ pub fn exploration_phase(
 
         if !sep.close_bin_and_scatter(target) {
             warn!("[BPEXPL] could not close a bin, stopping");
+            stop_reason = "could not close a bin";
             break;
         }
 
         // Try to resolve the overlap the scattering introduced.
+        let attempt_start = Instant::now();
         let (local_best, cts) = sep.separate(term);
         let total_loss: f32 = cts.values().map(|ct| ct.get_total_loss()).sum();
+        let attempt_secs = attempt_start.elapsed().as_secs_f32();
 
         if total_loss == 0.0 {
             // Feasibility with one bin fewer!
@@ -126,9 +140,27 @@ pub fn exploration_phase(
             // (now obsolete) bin count.
             infeas_sol_pool.clear();
             n_failed_attempts = 0;
+            // A new bin count is a new level: the loss history of the old one says nothing here.
+            best_level_loss = f32::INFINITY;
+            n_stagnant = 0;
         } else {
-            info!("[BPEXPL] unable to reach feasibility with {} bin(s) (dens: {:.3}%, min loss: {})",
-                sep.prob.layouts.len(), sep.prob.density() * 100.0, FMT().fmt2(total_loss));
+            // Did this attempt improve the best loss seen at this bin-count level meaningfully?
+            let improved = total_loss < best_level_loss * (1.0 - STAGNATION_MIN_IMPROVEMENT);
+            if total_loss < best_level_loss {
+                best_level_loss = total_loss;
+            }
+            match improved {
+                true => n_stagnant = 0,
+                false => n_stagnant += 1,
+            }
+            let strikes_left = config.max_conseq_failed_attempts
+                .map(|max| max.saturating_sub(n_failed_attempts + 1));
+            info!("[BPEXPL] unable to reach feasibility with {} bin(s) (dens: {:.3}%, min loss: {}, \
+                   best at this level: {}, {:.1}s, strikes left: {}, stagnant: {}/{})",
+                sep.prob.layouts.len(), sep.prob.density() * 100.0, FMT().fmt2(total_loss),
+                FMT().fmt2(best_level_loss), attempt_secs,
+                strikes_left.map_or("inf".to_string(), |n| n.to_string()),
+                n_stagnant, config.stagnation_limit.map_or("inf".to_string(), |n| n.to_string()));
             sol_listener.report(ReportType::ExplInfeas, &local_best, instance);
 
             // Keep the attempt in the pool, sorted by loss (best = lowest loss = first).
@@ -139,6 +171,20 @@ pub fn exploration_phase(
 
             if n_failed_attempts >= config.max_conseq_failed_attempts.unwrap_or(usize::MAX) {
                 info!("[BPEXPL] max consecutive failed attempts ({n_failed_attempts}), terminating");
+                stop_reason = "strikes exhausted";
+                break;
+            }
+
+            // Phase-wise stagnation stop: many failures in a row *and* none of them got the min
+            // loss meaningfully lower. More time at this bin count would only repeat them, so the
+            // remaining budget is worth more to the compression phase.
+            if let Some(limit) = config.stagnation_limit
+                && n_stagnant >= limit
+            {
+                info!("[BPEXPL] stagnated: {n_stagnant} attempt(s) without a >{:.0}% improvement of the \
+                       min loss ({}) at {} bin(s), handing the rest of the budget to compression",
+                    STAGNATION_MIN_IMPROVEMENT * 100.0, FMT().fmt2(best_level_loss), sep.prob.layouts.len());
+                stop_reason = "stagnation";
                 break;
             }
 
@@ -170,7 +216,7 @@ pub fn exploration_phase(
 
     // Always leave the separator on the best solution found.
     sep.rollback(&best, None);
-    info!("[BPEXPL] finished, best feasible solution: {} bin(s), cost: {}, dens: {:.3}%",
+    info!("[BPEXPL] finished ({stop_reason}), best feasible solution: {} bin(s), cost: {}, dens: {:.3}%",
         sep.prob.layouts.len(), best_cost, best.density(instance) * 100.0);
 
     feasible_sols
