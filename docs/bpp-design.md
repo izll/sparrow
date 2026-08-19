@@ -146,6 +146,46 @@ back into that layout (offset by the container bbox origin) — only if the resu
 * Determinism smoke test: two runs with the same seed and an iteration-bounded terminator give the same cost.
 * All under `cargo test` (debug assertions on).
 
+## Release-mode testing
+
+**Run the suites under both profiles:**
+
+```bash
+cargo test            # test profile: debug_assertions ON
+cargo test --release  # release profile: debug_assertions OFF
+```
+
+This is not belt-and-braces. `cargo test` uses the test profile, which keeps `debug_assertions` **on**,
+and a good deal of this codebase's correctness — the collision-tracker/layout agreement
+(`tracker_matches_layout`), the exploration phase's "the start must be feasible" precondition, the
+walled mode's wall/width invariants — is expressed as `debug_assert!`. Those assertions are compiled
+**out** of release builds, which is what real users run.
+
+The consequence is that a broken invariant behaves *differently* in the two profiles: under
+`cargo test` it aborts loudly at the assertion, while in release the bad value flows on silently and
+ends up in the exported JSON. A test that only ever runs in the first profile therefore cannot tell
+you what release does.
+
+Two confirmed bugs had exactly this shape:
+
+* the **walled warm start** handed an infeasible (wall-straddling) layout to `exploration_phase`,
+  which seeded it as feasible and exported it — 85 wall crossings in the output JSON, while
+  `cargo test` saw only the debug assertion;
+* the **BPP warm start** (`optimize_bpp`) trusted `BPProblem::restore` to validate its input, which it
+  does not: an incomplete or overlapping warm start was optimized and returned as valid. The library
+  entry point now checks demand coverage and per-layout `is_feasible()` itself, rather than relying
+  on `bpp_main`'s CLI-level check (which anyone calling the library bypasses).
+
+**Guidance for new tests:** assert on *returned data* — the solution, the exported JSON, or
+feasibility computed with jagua's `Layout::from_snapshot(&snap).is_feasible()` — rather than relying
+on a `debug_assert!` to fire. A test written that way is meaningful in both profiles. Where a test
+must exercise release semantics specifically (because a `debug_assert!` would trip first and mask the
+behaviour under test), mark it `#[cfg(not(debug_assertions))]`; `tests/sheet_tests.rs`'s
+`exploration_does_not_seed_an_infeasible_start_as_feasible` is the worked example.
+
+This applies to the **walled** (`tests/sheet_tests.rs`) and **BPP** (`tests/bpp_*.rs`) suites in
+particular, since both lean on `debug_assert!` for their core invariants.
+
 ## Phases / agents
 
 1. **Foundation** — `bpp/{mod,separator,worker,lbf}.rs`, `config.rs` additions, `Cargo.toml` feature. Must compile,

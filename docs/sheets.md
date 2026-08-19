@@ -92,12 +92,42 @@ sparrow -i input.json --sheet-width 2000 [--sheet-gap 20] [--min-sep 5] -e 30 -c
 | Flag | Meaning |
 | --- | --- |
 | `--sheet-width <MM>` | Usable width of one physical sheet. **Enables the mode.** |
-| `--sheet-gap <MM>` | Wall thickness. Defaults to `max(20, 2 * min-sep)`. |
+| `--sheet-gap <MM>` | Wall thickness. Defaults to `max(20, 2 * min-sep)`. **`0` is honoured** (with a warning), see "Gap semantics". |
 | `--compact-sheets` | Per-sheet left-compaction post-pass (phase 8). Secondary objective only. |
 | `--pack-down-sheets` | Cross-sheet pack-down in the compression phase (phase 8). **Off by default**, see below. |
 | `--plain-first` | Explore without walls first, then install them (phase 8). **Off by default**, see below. |
 
 Without `--sheet-width` the behaviour is the plain strip packing one, unchanged.
+
+### Gap semantics
+
+`--sheet-gap` is the thickness of the **virtual wall** between two consecutive sheets, so the pitch
+(distance between two sheets' left edges) is `width + gap`.
+
+* **Not given** → `max(20, 2 * min-sep)`. The default is generous on purpose: the gap costs nothing
+  physically (the sheets are separate objects) and a thick wall gives the GLS separator a smooth loss
+  gradient to push straddling items off a boundary.
+* **`--sheet-gap 0`** → honoured, with a warning. The sheets butt up against each other, the wall
+  intervals become degenerate (`x_min == x_max`) and are dropped entirely — the boundary is then
+  enforced only by the strip width, so an item may sit *exactly* on a boundary and the cut has no
+  kerf allowance. Previously this was silently replaced by the 20 mm default, laying the solution out
+  on a pitch the caller never asked for.
+* **A negative value** is rejected with a warning and the default is used instead.
+
+### Items wider than a sheet
+
+An item that does not fit inside a single sheet in **any** allowed rotation makes the walled mode
+unsolvable: it would have to straddle a wall. This is now checked once at startup
+(`sheets::items_too_wide_for_sheet`) and the run exits non-zero naming the offending items and their
+minimum widths, e.g.
+
+```
+Error: --sheet-width 700 mm is too narrow for this instance: item 0 (1742.0 mm), item 2 (1941.4 mm),
+       ... do(es) not fit inside a single sheet in any allowed rotation, so no walled solution can exist
+```
+
+Left undetected this surfaced either as an LBF "strip-width is running away" panic or — from a warm
+start, where the LBF is bypassed — as an exported layout full of wall crossings.
 
 ## Reporting
 
@@ -116,6 +146,23 @@ The **leftover band** is the secondary objective: the rectangular strip `[used, 
 right edge of a sheet. Unlike the gaps *between* the parts, this band is one contiguous rectangle and
 goes straight back into stock. The summary line splits the total waste into this reusable part and
 the internal gaps.
+
+### Straddling items are reported, never clamped
+
+An item is assigned to the sheet its **right** edge (`x_max`) falls on — the edge that determines how
+far into a sheet material is consumed. In a feasible walled solution both edges are on the same
+sheet, so the choice is immaterial; in an infeasible one they need not be, and such an item is now
+listed explicitly in `SheetStats::straddling_item_ids` and warned about:
+
+```
+[SHEET] [FINAL] 3 item(s) STRADDLE a sheet wall — this layout cannot be cut into sheets: 4@sheet7, 7@sheet7, 5@sheet8
+```
+
+The previous code derived the index from `x_min` and **clamped** it into range, so an uncuttable
+layout was reported as a perfectly ordinary one — the only hint being a density above 100 % or a used
+width larger than the sheet (e.g. "used 2611.4/700 mm, dens 178.2 %"). A straddling item means the
+strip cannot be cut at all, which matters far more than any of the other numbers, so it is said out
+loud.
 
 ## Results
 
@@ -167,18 +214,54 @@ the diagnosis: the issue is the absence of a cross-sheet relocation move, not a 
 * **Cross-sheet relocation exists but is not strong enough on every instance.** Phase 8 added it
   (see below); it fixes the synthetic cases and is a no-op risk elsewhere, but it does *not* rescue
   iso7. See "What phase 8 changed" for the measurements and the diagnosis.
-* **Warm starting from a wall-less solution.** An imported solution knows nothing about the walls, so
-  items may straddle them. `widen_for_walls` widens the strip by one spare sheet first, so the
-  separator has room to push those items off the walls; the exploration phase then shrinks the width
-  back down. Without this the run reports an *infeasible* layout as its answer (items overflowing
-  their sheet), because `exploration_phase` seeds its feasible-solution list with the unseparated
-  start. Note this is a pre-existing sharp edge in `exploration_phase` that the walls merely expose —
-  it is worked around at the call site rather than by changing shared SPP behaviour.
+* **Warm starting from a wall-less solution** — now *repaired and verified*, see below.
 * **Inferior quality zones (quality > 0) are unsupported** by the separator, and hit an explicit
   `unimplemented!`. Only holes (quality 0) are handled. Unlike holes, an inferior zone is forbidden
   only for *some* items, which the GLS tracker has no notion of.
 * **Walls are always vertical and evenly spaced.** Mixed sheet sizes or a horizontal grid would need
   a generalised `wall_intervals`.
+
+## Warm starting a walled run (`-i previous_solution.json --sheet-width W`)
+
+An imported solution knows nothing about the walls, so every part that happened to straddle a
+boundary now overlaps one. The start is therefore prepared in three steps:
+
+1. **`widen_for_walls`** grows the strip by one spare sheet, so the wall-crossers have somewhere to
+   go and the separator has room to work.
+2. **`repair_walled_warm_start`** (`src/optimizer/mod.rs`) then actually *performs* the repair: a
+   `separate()` with the patient wall-repair settings (`WALL_REPAIR_STRIKE_LIMIT`,
+   `WALL_REPAIR_ITER_NO_IMPRV_LIMIT`) on a bounded slice of the exploration budget
+   (`WALL_REPAIR_BUDGET_RATIO`).
+3. If the repair does **not** reach zero loss, the warm start is **discarded** in favour of a walled
+   LBF construction, which is feasible by construction. The pre-pass's work is lost, but a correct
+   answer from a worse start beats an infeasible one that gets exported as if it were fine.
+
+The separator handed to `exploration_phase` is thus feasible in every case.
+
+### Why step 2 is not optional
+
+`widen_for_walls` only creates *room* for the repair — it does not do the repair, and until this fix
+nothing downstream verified it either. `exploration_phase` seeds its feasible-solution list with
+whatever start it is given, **without testing it**, so the still-overlapping layout was recorded as
+feasible and came straight back out as the run's answer. In debug builds a `debug_assert!` caught
+this; in **release** it is compiled out, which is exactly where the bug bit.
+
+Measured (`swim.json` → 700 mm sheets): the exported JSON contained **85 wall crossings**, with
+per-sheet reports showing densities above 100 % and used widths of 2611 mm on a 700 mm sheet. After
+the fix that particular case is rejected up front (swim's parts are wider than 700 mm — see "Items
+wider than a sheet"), and a solvable one (2500 mm sheets) repairs successfully and validates clean.
+
+### Defence in depth: `exploration_phase`
+
+The phase itself no longer trusts its start blindly. It still `debug_assert!`s feasibility, but in
+release it now *checks* the start's loss and simply does **not** seed an infeasible layout into its
+feasible-solution list — the phase has to earn its first feasible solution through `separate()` like
+any other width. `best_width` starts at `+inf` in that case so the first solution found at any width
+is recorded, and the phase may legitimately return an **empty** list if it never reaches feasibility;
+`optimize` handles that.
+
+For a feasible start this is bit-identical to the previous behaviour (the check passes, the start is
+seeded, no RNG is touched), so plain SPP is unaffected.
 
 ## Phase 8: cross-sheet relocation
 
@@ -279,6 +362,18 @@ inside **its own sheet** as it goes without colliding (binary search on the disp
 `COMPACT_MIN_SHIFT = 0.5 mm`, every probe verified against the CDE and undone if it collides). The
 many small gaps between the parts thus migrate into one contiguous, reusable right-hand band per
 sheet.
+
+**Key handling (was a crash).** `Separator::move_item` removes and re-places the item, so it mints a
+**new `PItemKey` on every call — including the undo of a failed probe**. `try_shift` therefore
+returns `(key, accepted)` and the caller must adopt the returned key in *both* branches; the key it
+passed in is dangling on return. The original code dropped the key from the undo branch, so the
+binary search's next probe reused a stale key and the run died with `invalid SlotMap key used`
+(reproducible with `--sheet-width 2500 --compact-sheets -e 12 -c 8 -s 0` on swim).
+
+Because the search can end on a *failed* probe — which restores the item to its original position —
+the best accepted shift is **re-applied** afterwards if the item is no longer sitting at it.
+Without that the item silently stayed put while `n_moved` claimed it had moved; `n_moved` is now
+truthful.
 
 This is a pure *translation* pass rather than the re-nesting phase 7 sketched (`consolidate_layout`
 on an SPP sub-problem). The translation version cannot make the solution worse, needs no budget
@@ -399,6 +494,38 @@ compaction folded in. That is a bigger piece of work than a move, and it is the 
   sheets) run through the *whole* `optimize()` pipeline reaches 2 sheets, feasible, zero straddling —
   the regression test for the cross-sheet relocation operator;
 * with `sheet = None` the tracker allocates **no** hole entries at all.
+
+### Regression tests for the review findings
+
+Added in `tests/sheet_tests.rs`. All of them assert on **returned data** (solutions, stats, counts)
+rather than on debug assertions, so they are meaningful under `cargo test --release` too — which is
+where the two critical bugs actually lived, `debug_assert!`s being compiled out there.
+
+| Test | Guards |
+| --- | --- |
+| `walled_warm_start_never_returns_an_infeasible_layout` | CRITICAL 1. A wall-less solution is optimized, then imported as the warm start of a 2000 mm walled run (asserted to genuinely straddle). The separator `repair_walled_warm_start` produces must have **zero** loss, be wall-clear and still place all demand; the solution `optimize()` returns must be `is_feasible()` with zero straddling. Fails before the fix with a loss of ~4.8 M handed to `exploration_phase`. |
+| `exploration_does_not_seed_an_infeasible_start_as_feasible` | CRITICAL 1, unit. An item is parked on a wall and the phase is run; every returned solution must be feasible and wall-clear. **`#[cfg(not(debug_assertions))]`** — the `debug_assert!` in `exploration_phase` would trip first under the test profile, and the bug is release-only, so the test runs where the bug lives. |
+| `compact_sheets_completes_and_only_moves_items_left` | CRITICAL 2. `compact_sheets_left` on a ≥2-sheet swim layout must not panic, must stay feasible and wall-clear, must not lose items or change the sheet count, `n_moved` must be truthful (if it claims movement, some item really moved), and **no item may end further right**. Fails before the fix with `invalid SlotMap key used`. |
+| `sheet_stats_reports_straddling_items` | `sheet_stats` must report an item parked on a wall in `straddling_item_ids` instead of clamping it into a sheet, while a clean layout reports none. |
+| `items_too_wide_for_a_sheet_are_detected` | 700 mm sheets are reported as too narrow for swim (with the offending widths), 2500 mm ones are not. |
+| `zero_sheet_gap_is_honoured` | `resolve_gap(Some(0.0), _) == 0.0`, explicit gaps pass through, the default still respects `2 * min_sep`, and a zero gap yields degenerate wall intervals that `apply_sheet_walls` filters out. |
+
+## Release-mode testing
+
+`cargo test` uses the **test profile, with `debug_assertions` ON**. Several of the walled/BPP
+invariants are guarded by `debug_assert!`, which means a bug they cover is *masked* in `cargo test`
+(the assertion fires, so the test "fails loudly" for the right reason) and *unmasked* in release
+(the assertion is gone and the bad value flows on silently into the exported JSON).
+
+Both criticals fixed here were of exactly that shape. So:
+
+```bash
+cargo test            # debug assertions ON  — catches invariant violations early
+cargo test --release  # debug assertions OFF — catches what release users actually get
+```
+
+Run **both**. Tests that specifically exercise release semantics are marked
+`#[cfg(not(debug_assertions))]` and only execute in the second.
 
 ## SPP regression safety
 

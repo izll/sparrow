@@ -211,20 +211,37 @@ fn main() -> Result<()> {
             handles.into_iter().map(|h| h.join().expect("optimization thread panicked")).collect()
         });
 
-        for (run_idx, sol) in solutions.iter() {
-            info!("[MAIN] run {} (seed {}): {}", run_idx, seed + *run_idx as u64, bpp_io::summarize(sol, &instance));
+        // Only feasible runs may be selected. An infeasible solution packs into *fewer* bins exactly
+        // because its parts overlap, so selecting on cost alone systematically prefers the broken
+        // run over the correct ones.
+        let mut feasible = vec![];
+        for (run_idx, sol) in solutions.into_iter() {
+            let bad = sol.layout_snapshots.iter()
+                .find(|(_, ls)| !jagua_rs::entities::Layout::from_snapshot(ls).is_feasible())
+                .map(|(lkey, _)| lkey);
+            info!("[MAIN] run {} (seed {}): {}{}", run_idx, seed + run_idx as u64,
+                bpp_io::summarize(&sol, &instance),
+                if bad.is_none() { String::new() } else { format!("  <-- INFEASIBLE ({:?}), excluded", bad.unwrap()) });
+            match bad {
+                None => feasible.push((run_idx, sol)),
+                Some(lkey) => warn!("[MAIN] run {} (seed {}) produced an infeasible layout ({lkey:?}) and is excluded from the selection",
+                    run_idx, seed + run_idx as u64),
+            }
+        }
+        if feasible.is_empty() {
+            bail!("all {} parallel runs produced infeasible layouts; nothing to export", n_runs);
         }
         // Best = lowest cost, ties broken by the **lowest density of the least dense bin**: at equal
         // bin count the useful result is the one whose leftover material is concentrated in a single
         // bin (= the biggest consolidated remainder), not the one that spreads the same slack evenly.
         // `min_by` returns the first minimum.
-        let (best_idx, best_sol) = solutions.into_iter()
+        let (best_idx, best_sol) = feasible.into_iter()
             .min_by(|(_, a), (_, b)| {
                 a.cost(&instance).cmp(&b.cost(&instance))
                     .then_with(|| min_bin_density(a, &instance)
                         .partial_cmp(&min_bin_density(b, &instance)).unwrap_or(Ordering::Equal))
             })
-            .expect("at least one run");
+            .expect("the feasible list is non-empty");
         info!("[MAIN] best run: {} (seed {}), {}", best_idx, seed + best_idx as u64, bpp_io::summarize(&best_sol, &instance));
 
         // Export the final SVGs of the best run

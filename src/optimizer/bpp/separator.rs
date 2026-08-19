@@ -435,6 +435,12 @@ impl BPSeparator {
             return false;
         }
 
+        // Taken before anything is removed, so the scatter can bail out cleanly if an item turns
+        // out not to fit any surviving bin (see the sampler below): by that point the closed bin's
+        // items are already gone, and without this the separator would be left in a half-scattered
+        // state with items missing from the problem entirely.
+        let snapshot_before = self.save();
+
         // --- 1. Collect and remove the content of the target layout --------------------------
         // Deterministic order (SlotMap iteration), sorted largest-first by original item area.
         let mut items_to_scatter = self.prob.layouts[lkey].placed_items.keys().collect_vec();
@@ -468,9 +474,19 @@ impl BPSeparator {
             let item = self.instance.item(*item_id);
             let dst_bbox = self.prob.layouts[dst_lkey].container.outer_cd.bbox;
 
-            // Sample a random (feasible-rotation) position anywhere inside the destination container
-            let sampler = UniformBBoxSampler::new(dst_bbox, item, dst_bbox)
-                .expect("item should fit inside the destination container bbox in at least one rotation");
+            // Sample a random (feasible-rotation) position anywhere inside the destination
+            // container. The item may genuinely not fit this particular bin in any rotation (bins
+            // of different sizes are allowed), which is a routine outcome rather than a bug — so
+            // skip that destination instead of panicking mid-scatter and leaving the problem with
+            // the closed bin's items already removed.
+            let Some(sampler) = UniformBBoxSampler::new(dst_bbox, item, dst_bbox) else {
+                warn!("[BPSEP] item {item_id} does not fit into layout {dst_lkey:?} in any rotation; \
+                       aborting the scatter and restoring the previous solution");
+                let (sol, cts) = &snapshot_before;
+                self.rollback(sol, Some(cts));
+                self.reseed_workers();
+                return false;
+            };
             let d_transf = sampler.sample(&mut self.rng);
 
             self.prob.place_item(BPPlacement {

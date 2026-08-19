@@ -138,12 +138,27 @@ impl SheetConfig {
         self.width + self.gap
     }
 
-    /// Resolves the gap to use: the explicit CLI value if given, otherwise
+    /// Resolves the gap to use: **any** explicit CLI value if given (including `0`), otherwise
     /// `max(MIN_DEFAULT_SHEET_GAP, 2 * min_item_separation)`.
+    ///
+    /// `--sheet-gap 0` is a legitimate request — sheets butt up against each other with no kerf —
+    /// and used to be swallowed by the `g > 0.0` guard, silently substituting the 20 mm default and
+    /// producing a layout laid out on a pitch the caller never asked for. It is honoured now, with a
+    /// warning: a zero-width wall cannot separate the sheets geometrically, so an item may sit
+    /// exactly on a boundary and the cut has no kerf allowance.
     pub fn resolve_gap(cli_gap: Option<f32>, min_item_separation: Option<f32>) -> f32 {
         match cli_gap {
             Some(g) if g > 0.0 => g,
-            _ => MIN_DEFAULT_SHEET_GAP.max(2.0 * min_item_separation.unwrap_or(0.0)),
+            Some(0.0) => {
+                log::warn!("[CFG] --sheet-gap 0: the sheet boundaries get zero-width walls, so items \
+                            may touch a boundary exactly and the cut has no kerf allowance");
+                0.0
+            }
+            Some(g) => {
+                log::warn!("[CFG] ignoring a negative --sheet-gap ({g}); using the default instead");
+                MIN_DEFAULT_SHEET_GAP.max(2.0 * min_item_separation.unwrap_or(0.0))
+            }
+            None => MIN_DEFAULT_SHEET_GAP.max(2.0 * min_item_separation.unwrap_or(0.0)),
         }
     }
 }

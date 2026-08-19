@@ -82,8 +82,23 @@ pub fn optimize(
             let plain_budget = expl_config.time_limit.mul_f32(sheet.plain_first_ratio.clamp(0.0, 1.0));
             plain_first_prepass(&instance, &mut next_rng, sol_listener, terminator, expl_config, sheet, plain_budget)
         }
-        (false, Some(start_prob)) =>
-            Separator::new_with_sheet(instance.clone(), start_prob, next_rng(), expl_config.separator_config, expl_config.sheet),
+        (false, Some(start_prob)) => {
+            let sep = Separator::new_with_sheet(instance.clone(), start_prob, next_rng(), expl_config.separator_config, expl_config.sheet);
+            match (initial_solution, expl_config.sheet) {
+                // A **walled warm start**: the imported solution knows nothing about the sheet
+                // walls, so items straddling a boundary now overlap one. `widen_for_walls` above
+                // only gives the separator *room* to repair that — it does not do the repair, and
+                // nothing downstream verified it either. In release (no debug assertions) the
+                // still-overlapping layout was then seeded straight into `exploration_phase` as a
+                // feasible solution and exported: measured on swim -> 700 mm sheets, 85 wall
+                // crossings in the output JSON.
+                //
+                // So repair it here, exactly like the plain-first pipeline does, and fall back to a
+                // walled LBF (feasible by construction) when the repair does not reach zero loss.
+                (Some(_), Some(sheet)) => repair_walled_warm_start(&instance, sep, &mut next_rng, sol_listener, expl_config, sheet),
+                _ => sep,
+            }
+        }
         (false, None) => unreachable!("a non plain-first run always builds a starting problem"),
     };
 
@@ -96,7 +111,18 @@ pub fn optimize(
         terminator,
         expl_config,
     );
-    let final_explore_sol = solutions.last().unwrap().clone();
+    // `exploration_phase` returns an empty list only when it started from an infeasible layout and
+    // never separated its way to a feasible one. Every start built here is repaired first (walled
+    // warm start, plain-first pre-pass) or feasible by construction (LBF), so falling back to the
+    // separator's current layout is a belt-and-braces path rather than an expected one.
+    let final_explore_sol = match solutions.last() {
+        Some(sol) => sol.clone(),
+        None => {
+            warn!("[OPT] the exploration phase never reached a feasible solution; \
+                   continuing from its final (possibly infeasible) layout");
+            expl_separator.prob.save()
+        }
+    };
     if let Some(sheet) = expl_config.sheet.as_ref() {
         log_sheet_report("EXPL", &final_explore_sol, &instance, sheet);
     }
@@ -121,6 +147,59 @@ pub fn optimize(
 
     // Return the final compressed solution
     cmpr_sol
+}
+
+/// Repairs a **walled warm start** before it reaches the exploration phase.
+///
+/// A solution imported with `-i some_solution.json --sheet-width W` was produced without any notion
+/// of the sheet walls, so every part that happened to straddle a boundary now overlaps a wall.
+/// [`widen_for_walls`] has already granted the strip a whole spare sheet's worth of slack for those
+/// parts to move into, but the move itself has to be made by the separator.
+///
+/// Runs [`Separator::separate`] with the patient wall-repair settings; on success the separator is
+/// returned holding the repaired (feasible) layout. If the repair cannot reach zero loss the warm
+/// start is abandoned in favour of a **walled LBF** construction — feasible by construction, and a
+/// correct answer from a worse start beats an infeasible one that gets exported as if it were fine.
+pub fn repair_walled_warm_start(
+    instance: &SPInstance,
+    mut sep: Separator,
+    next_rng: &mut impl FnMut() -> Xoshiro256PlusPlus,
+    sol_listener: &mut impl SolutionListener,
+    expl_config: &ExplorationConfig,
+    sheet: SheetConfig,
+) -> Separator {
+    if sep.ct.get_total_loss() == 0.0 {
+        // Nothing straddled a wall (or the walls happen to fall into the gaps): keep it as is.
+        info!("[OPT] [SHEET] the warm start is already clear of the walls, no repair needed");
+        return sep;
+    }
+
+    info!("[OPT] [SHEET] the warm start overlaps the sheet walls (loss: {}); repairing before exploration",
+        crate::FMT().fmt2(sep.ct.get_total_loss()));
+
+    let outer_cfg = sep.config;
+    sep.config.strike_limit = outer_cfg.strike_limit.max(WALL_REPAIR_STRIKE_LIMIT);
+    sep.config.iter_no_imprv_limit = outer_cfg.iter_no_imprv_limit.max(WALL_REPAIR_ITER_NO_IMPRV_LIMIT);
+
+    // The repair gets a bounded slice of the exploration budget, so a hopeless one cannot eat the
+    // whole run; the LBF fallback below it is cheap.
+    let mut repair_term = BasicTerminator::new();
+    repair_term.new_timeout(expl_config.time_limit.mul_f32(WALL_REPAIR_BUDGET_RATIO));
+    let (repaired, ct) = sep.separate(&repair_term, sol_listener);
+    let loss = ct.get_total_loss();
+    sep.rollback(&repaired, Some(&ct));
+    sep.config = outer_cfg;
+
+    if loss == 0.0 {
+        info!("[OPT] [SHEET] warm-start wall repair succeeded: {} sheet(s) at {:.3}%, all items clear of the walls",
+            n_sheets(sep.prob.strip_width(), &sheet), sep.prob.density() * 100.0);
+        return sep;
+    }
+
+    warn!("[OPT] [SHEET] warm-start wall repair failed (min loss {}); discarding the warm start and \
+           falling back to a walled LBF construction", crate::FMT().fmt2(loss));
+    let builder = LBFBuilder::new_with_sheet(instance.clone(), next_rng(), LBF_SAMPLE_CONFIG, Some(sheet)).construct();
+    Separator::new_with_sheet(builder.instance, builder.prob, next_rng(), expl_config.separator_config, Some(sheet))
 }
 
 /// The wall-less pre-pass of [`SheetPipeline::PlainFirst`].
@@ -155,7 +234,11 @@ fn plain_first_prepass(
 
     terminator.new_timeout(plain_budget);
     let plain_sols = exploration_phase(instance, &mut plain_sep, sol_listener, terminator, &plain_expl_config);
-    let plain_best = plain_sols.last().expect("the exploration phase always returns a solution").clone();
+    // The pre-pass starts from a wall-less LBF construction, which is feasible by construction, so
+    // the exploration phase always records at least that one solution.
+    let plain_best = plain_sols.last()
+        .expect("the wall-less pre-pass starts from a feasible LBF, so it always yields a solution")
+        .clone();
     info!("[OPT] [SHEET] plain pre-pass finished: width {:.1} ({:.3}%) = {} sheet(s) of {}",
         plain_best.strip_width(), plain_best.density(instance) * 100.0,
         (plain_best.strip_width() / sheet.width).ceil().max(1.0) as usize, sheet.width);

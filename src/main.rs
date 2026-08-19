@@ -115,6 +115,23 @@ fn main() -> Result<()>{
     );
 
     info!("[MAIN] loaded instance {} with #{} items", ext_instance.name, instance.total_item_qty());
+
+    // In the walled mode an item wider than one sheet (in every allowed rotation) can never be
+    // placed: it would have to straddle a wall. Left undetected this surfaces either as an LBF
+    // "strip-width is running away" panic or — from a warm start, where the LBF is bypassed — as an
+    // exported layout full of wall crossings. Fail loudly and early instead.
+    if let Some(sheet) = sheet.as_ref() {
+        let too_wide = sparrow::optimizer::sheets::items_too_wide_for_sheet(&instance, sheet);
+        if !too_wide.is_empty() {
+            let list = too_wide.iter()
+                .map(|(id, w)| format!("item {id} ({:.1} mm)", w))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("--sheet-width {} mm is too narrow for this instance: {} do(es) not fit inside a \
+                   single sheet in any allowed rotation, so no walled solution can exist",
+                sheet.width, list);
+        }
+    }
     
     let final_svg_path = format!("{OUTPUT_DIR}/final_{}.svg", ext_instance.name);
     let intermediate_svg_dir = match cfg!(feature = "only_final_svg") {
@@ -165,12 +182,29 @@ fn main() -> Result<()>{
             handles.into_iter().map(|h| h.join().expect("optimization thread panicked")).collect()
         });
 
-        for (run_idx, sol) in solutions.iter() {
-            info!("[MAIN] run {} (seed {}): width: {:.3}, density: {:.3}%", run_idx, seed + *run_idx as u64, sol.strip_width(), sol.density(&instance) * 100.0);
+        // Pick the narrowest solution **among the feasible ones**. Selecting on width alone lets an
+        // infeasible run win precisely because it is infeasible: overlapping parts pack into a
+        // narrower strip than separated ones ever could, so the worst run is the most likely to be
+        // chosen and exported.
+        let mut feasible = vec![];
+        for (run_idx, sol) in solutions.into_iter() {
+            let ok = jagua_rs::entities::Layout::from_snapshot(&sol.layout_snapshot).is_feasible();
+            info!("[MAIN] run {} (seed {}): width: {:.3}, density: {:.3}%{}",
+                run_idx, seed + run_idx as u64, sol.strip_width(), sol.density(&instance) * 100.0,
+                if ok { "" } else { "  <-- INFEASIBLE, excluded" });
+            if ok {
+                feasible.push((run_idx, sol));
+            } else {
+                warn!("[MAIN] run {} (seed {}) produced an infeasible layout and is excluded from the selection",
+                    run_idx, seed + run_idx as u64);
+            }
         }
-        let (best_idx, best_sol) = solutions.into_iter()
+        if feasible.is_empty() {
+            bail!("all {} parallel runs produced infeasible layouts; nothing to export", n_runs);
+        }
+        let (best_idx, best_sol) = feasible.into_iter()
             .min_by(|(_, a), (_, b)| a.strip_width().partial_cmp(&b.strip_width()).unwrap())
-            .expect("at least one run");
+            .expect("the feasible list is non-empty");
         info!("[MAIN] best run: {} (seed {}), width: {:.3}, density: {:.3}%", best_idx, seed + best_idx as u64, best_sol.strip_width(), best_sol.density(&instance) * 100.0);
 
         // Export the final SVG of the best run

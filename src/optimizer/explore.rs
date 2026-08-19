@@ -21,15 +21,36 @@ use std::cmp::Reverse;
 /// Algorithm 12 from https://doi.org/10.48550/arXiv.2509.13329
 pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listener: &mut impl SolutionListener, term: &impl Terminator, config: &ExplorationConfig) -> Vec<SPSolution> {
     let mut current_width = sep.prob.strip_width();
-    let mut best_width = current_width;
+    // The narrowest width a feasible solution has been recorded at. Starts at the initial width
+    // when that layout is feasible (it is recorded below), and at +infinity otherwise, so that the
+    // first solution the phase separates at *any* width is recorded.
+    let mut best_width = f32::INFINITY;
 
-    // The exploration phase assumes it starts from a feasible (collision-free) layout: it is recorded as the first
-    // feasible solution without being separated. Callers that build the start themselves (warm starts, sheet-wall
-    // installation) must guarantee this; in debug builds we verify it.
-    debug_assert!(sep.ct.get_total_loss() == 0.0, "[EXPL] exploration must start from a feasible layout (loss: {})", sep.ct.get_total_loss());
-    let mut feasible_sols = vec![sep.prob.save()];
+    // The exploration phase assumes it starts from a feasible (collision-free) layout: the start is
+    // recorded as the first feasible solution *without* being separated, so an infeasible start
+    // would be reported — and exported — as a feasible answer.
+    //
+    // Callers that build the start themselves (warm starts, sheet-wall installation) are expected
+    // to guarantee this, and the debug assertion below catches them when they don't. But debug
+    // assertions are off in release, where the very same bug silently writes out a layout with
+    // overlapping parts, so the check is repeated at runtime: an infeasible start is simply *not*
+    // seeded into `feasible_sols`, and the phase has to earn its first feasible solution through
+    // `separate()` like any other width.
+    //
+    // For a feasible start this is bit-identical to the previous behaviour (the check passes, the
+    // start is seeded, no RNG is touched), so plain strip packing is unaffected.
+    let start_loss = sep.ct.get_total_loss();
+    debug_assert!(start_loss == 0.0, "[EXPL] exploration must start from a feasible layout (loss: {start_loss})");
 
-    sol_listener.report(ReportType::ExplFeas, &feasible_sols[0], instance);
+    let mut feasible_sols = vec![];
+    if start_loss == 0.0 {
+        feasible_sols.push(sep.prob.save());
+        best_width = current_width;
+        sol_listener.report(ReportType::ExplFeas, &feasible_sols[0], instance);
+    } else {
+        warn!("[EXPL] the starting layout is NOT feasible (loss: {}); it will not be recorded as a \
+               feasible solution — the phase must separate its way to one first", FMT().fmt2(start_loss));
+    }
     info!("[EXPL] starting optimization with initial width: {:.3} ({:.3}%)",current_width,sep.prob.density() * 100.0);
 
     let mut infeas_sol_pool: Vec<(SPSolution, f32)> = vec![];
@@ -43,7 +64,8 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
     // The sheet count the strikes above were collected at.
     let mut drop_strikes_at: Option<usize> = None;
     // The tightest feasible solution seen so far: what a drop attempt starts from and rolls back to.
-    let mut last_feasible: Option<SPSolution> = Some(feasible_sols[0].clone());
+    // `None` when the start was infeasible and nothing feasible has been found yet.
+    let mut last_feasible: Option<SPSolution> = feasible_sols.first().cloned();
     // Consecutive failures of the *fine* shrink since the last feasible solution. The drop is only
     // attempted once this reaches `SHEET_DROP_AFTER_SHRINK_FAILURES`; see there.
     let mut shrink_failures = 0usize;
@@ -186,7 +208,12 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
         }
     }
 
-    info!("[EXPL] finished, best feasible solution: width: {:.3} ({:.3}%)",best_width,feasible_sols.last().unwrap().density(instance) * 100.0);
+    match feasible_sols.last() {
+        Some(best) => info!("[EXPL] finished, best feasible solution: width: {:.3} ({:.3}%)",
+            best_width, best.density(instance) * 100.0),
+        // Only reachable from an infeasible start that the phase never managed to separate.
+        None => warn!("[EXPL] finished WITHOUT ever reaching a feasible solution"),
+    }
 
     feasible_sols
 }

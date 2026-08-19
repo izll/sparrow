@@ -81,6 +81,23 @@ pub fn optimize_bpp(
             .expect("[BPOPT] failed to construct an initial solution"),
         Some(init_sol) => {
             info!("[BPOPT] warm starting from provided initial solution");
+
+            // `BPProblem::restore` trusts its input completely: it neither checks the snapshots for
+            // collisions nor invents placements for missing demand. The exploration phase then
+            // records the restored layout as its first feasible solution without testing it, so a
+            // bad warm start is optimized and returned as if it were valid. `bpp_main` validates
+            // this for the CLI, but `optimize_bpp` is a library entry point that anyone can call —
+            // and in release the debug assertions that would have caught it are gone. Check here
+            // too, at the point where the guarantee is actually needed.
+            let n_placed: usize = init_sol.layout_snapshots.values().map(|ls| ls.placed_items.len()).sum();
+            assert_eq!(n_placed, instance.total_item_qty(),
+                "[BPOPT] the warm start places {n_placed} item(s) but the instance demands {}; \
+                 `restore` cannot invent the missing placements", instance.total_item_qty());
+            for (lkey, ls) in init_sol.layout_snapshots.iter() {
+                assert!(jagua_rs::entities::Layout::from_snapshot(ls).is_feasible(),
+                    "[BPOPT] layout {lkey:?} of the warm start solution is not collision-free");
+            }
+
             let mut prob = BPProblem::new(instance.clone());
             prob.restore(init_sol);
             prob

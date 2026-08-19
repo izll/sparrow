@@ -54,8 +54,17 @@ impl Separator {
         // MÉRÉSHEZ (MADisoCAD): a szálszám kívülről állítható, hogy ugyanazon a
         // bemeneten összehasonlítható legyen 1 / 3 / 8 / 16 worker.
         if let Ok(v) = std::env::var("SPARROW_N_WORKERS") {
-            if let Ok(n) = v.parse::<usize>() {
-                if n > 0 { config.n_workers = n; }
+            match v.parse::<usize>() {
+                Ok(n) if n > 0 => {
+                    if n != config.n_workers {
+                        // Silently changing the worker count changes the search's results as well
+                        // as its speed, so an override this invisible has to announce itself.
+                        log::warn!("[SEP] SPARROW_N_WORKERS={n} overrides the configured worker count ({}); \
+                                    results are not comparable with an unset run", config.n_workers);
+                    }
+                    config.n_workers = n;
+                }
+                _ => log::warn!("[SEP] ignoring SPARROW_N_WORKERS={v:?}: not a positive integer"),
             }
         }
         let ct = CollisionTracker::new(&prob.layout);

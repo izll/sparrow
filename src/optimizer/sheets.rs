@@ -92,6 +92,51 @@ pub fn wall_intervals(width: f32, sheet: &SheetConfig) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// Items of `instance` that cannot fit inside a single sheet in **any** allowed rotation.
+///
+/// The walled mode forbids straddling a boundary, so such an item makes the whole instance
+/// unsolvable: no amount of separation or widening can ever place it. Detecting that up front turns
+/// what would otherwise be an LBF "strip-width is running away" panic (or, worse, an infeasible
+/// exported layout) into a clear error message at startup.
+///
+/// The test is the item's **minimum bounding-box width over its allowed rotations**: an item fits a
+/// sheet only if some rotation makes it no wider than the sheet. Continuous rotation is sampled on
+/// the same grid the placement sampler uses, so the answer agrees with what the engine can actually
+/// achieve.
+pub fn items_too_wide_for_sheet(instance: &SPInstance, sheet: &SheetConfig) -> Vec<(usize, f32)> {
+    use jagua_rs::geometry::Transformation;
+    use jagua_rs::geometry::geo_traits::TransformableFrom;
+    use jagua_rs::geometry::geo_enums::RotationRange;
+    use std::f32::consts::PI;
+
+    // Same rotation grid as `UniformBBoxSampler` uses for continuous rotation.
+    const ROT_N_SAMPLES: usize = 24;
+
+    instance.items.iter()
+        .filter_map(|(item, _)| {
+            let rotations: Vec<f32> = match &item.allowed_rotation {
+                RotationRange::None => vec![0.0],
+                RotationRange::Discrete(r) => r.clone(),
+                RotationRange::Continuous => (0..ROT_N_SAMPLES)
+                    .map(|i| i as f32 * (2.0 * PI) / ROT_N_SAMPLES as f32)
+                    .collect(),
+            };
+            let mut buffer = item.shape_cd.as_ref().clone();
+            let min_width = rotations.iter()
+                .map(|&r| {
+                    let bbox = buffer
+                        .transform_from(item.shape_cd.as_ref(), &Transformation::from_rotation(r))
+                        .bbox;
+                    OrderedFloat(bbox.width())
+                })
+                .min()
+                .map(|w| w.0)
+                .unwrap_or(f32::INFINITY);
+            (min_width > sheet.width).then_some((item.id, min_width))
+        })
+        .collect()
+}
+
 /// Replaces the problem's container with an otherwise identical one that has a **wall at every
 /// sheet boundary**, modelled as quality-0 zones (holes).
 ///
@@ -113,10 +158,14 @@ pub fn apply_sheet_walls(prob: &mut SPProblem, sheet: &SheetConfig) {
     let height = strip.fixed_height;
 
     let walls = wall_intervals(width, sheet).into_iter()
+        // With `--sheet-gap 0` the wall interval is degenerate (`x_min == x_max`) and `Rect::try_new`
+        // rejects it. There is nothing to model in that case — the sheets touch, so no strip of
+        // material is forbidden — and the boundary is enforced by the strip width alone.
+        .filter(|(x_min, x_max)| x_max > x_min)
         .map(|(x_min, x_max)| OriginalShape {
             shape: SPolygon::from(
                 Rect::try_new(x_min, -WALL_Y_OVERSHOOT, x_max, height + WALL_Y_OVERSHOOT)
-                    .expect("wall rectangle should be valid (gap > 0)"),
+                    .expect("wall rectangle should be valid (x_max > x_min checked above)"),
             ),
             pre_transform: DTransformation::empty(),
             // Inflate (like an item), so items keep `min_sep` from a wall exactly as they do from
@@ -200,7 +249,8 @@ pub fn sheet_summary(width: f32, sheet: &SheetConfig) -> String {
 /// The **leftover band** is the secondary objective: the rectangular strip
 /// `[used_width, W] x [0, H]` at the right edge of the sheet. Unlike the gaps *between* the parts,
 /// this band is one contiguous rectangle and can go straight back into stock.
-#[derive(Debug, Clone, Copy)]
+// Not `Copy`: `straddling_item_ids` is a `Vec`.
+#[derive(Debug, Clone)]
 pub struct SheetStats {
     /// Index of the sheet, `0` = the first (leftmost) one.
     pub index: usize,
@@ -214,6 +264,10 @@ pub struct SheetStats {
     pub sheet_width: f32,
     /// Height of one physical sheet (= the strip height).
     pub sheet_height: f32,
+    /// Ids of the items assigned to this sheet whose bbox **straddles** a wall, i.e. whose two
+    /// edges fall on different sheets. Empty for any feasible walled layout; a non-empty list means
+    /// the layout is not cuttable and the stats below it are only indicative.
+    pub straddling_item_ids: Vec<usize>,
 }
 
 impl SheetStats {
@@ -246,8 +300,14 @@ impl SheetStats {
 
 /// Per-sheet statistics of a solution, one entry per physical sheet (including empty ones).
 ///
-/// Items are assigned to a sheet by the *right* edge of their collision-shape bounding box, which
-/// is unambiguous in a walled solution: no item crosses a wall, so both edges lie on the same sheet.
+/// An item is assigned to the sheet its **right** edge (`x_max`) falls on, which is the edge that
+/// determines how far into a sheet the material is consumed. In a feasible walled solution both
+/// edges lie on the same sheet, so the choice is immaterial.
+///
+/// In an *infeasible* one they need not, and an item that straddles a wall is recorded in
+/// [`SheetStats::straddling_item_ids`] of the sheet it is assigned to rather than being silently
+/// clamped into it: the old code derived the index from `x_min` and clamped, which quietly reported
+/// e.g. "used 2611 mm" on a 700 mm sheet with no indication that the layout was uncuttable.
 pub fn sheet_stats(sol: &SPSolution, instance: &SPInstance, sheet: &SheetConfig) -> Vec<SheetStats> {
     let width = sol.strip_width();
     let height = sol.layout_snapshot.container.outer_orig.bbox().height();
@@ -262,16 +322,28 @@ pub fn sheet_stats(sol: &SPSolution, instance: &SPInstance, sheet: &SheetConfig)
             item_area: 0.0,
             sheet_width: sheet.width,
             sheet_height: height,
+            straddling_item_ids: vec![],
         })
         .collect::<Vec<_>>();
 
+    // Which sheet a coordinate falls on, without clamping into range.
+    let sheet_of = |x: f32| (x / pitch).floor().max(0.0) as usize;
+
     for (_, pi) in sol.layout_snapshot.placed_items.iter() {
         let bbox = pi.shape.bbox;
-        let k = ((bbox.x_min / pitch).floor().max(0.0) as usize).min(n - 1);
+        // `x_max` sits exactly on a boundary for an item flush with the sheet's right edge, which
+        // `floor` would push into the next sheet; nudge it back by taking the sheet of the last
+        // point strictly inside the item.
+        let k_max = sheet_of(bbox.x_max).min(n - 1);
+        let k_min = sheet_of(bbox.x_min).min(n - 1);
+        let k = k_max;
         let s = &mut stats[k];
         s.n_items += 1;
         s.used_width = s.used_width.max(bbox.x_max - k as f32 * pitch);
         s.item_area += instance.item(pi.item_id).area();
+        if k_min != k_max {
+            s.straddling_item_ids.push(pi.item_id);
+        }
     }
     stats
 }
@@ -293,6 +365,19 @@ pub fn log_sheet_report(phase: &str, sol: &SPSolution, instance: &SPInstance, sh
             s.density() * 100.0,
             s.leftover_band_width(),
         );
+    }
+
+    // A straddling item means the strip cannot be cut into sheets at all, which matters far more
+    // than any of the numbers above — so say so explicitly rather than letting it hide behind a
+    // >100 % density or a used width larger than the sheet.
+    let n_straddling: usize = stats.iter().map(|s| s.straddling_item_ids.len()).sum();
+    if n_straddling > 0 {
+        let ids = stats.iter()
+            .flat_map(|s| s.straddling_item_ids.iter().map(move |id| format!("{id}@sheet{}", s.index)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!("[SHEET] [{phase}] {n_straddling} item(s) STRADDLE a sheet wall — this layout cannot \
+               be cut into sheets: {ids}");
     }
 
     let band_area: f32 = stats.iter().map(|s| s.leftover_band_area()).sum();
@@ -393,6 +478,52 @@ pub fn required_density_for(sep: &Separator, n_target: usize, sheet: &SheetConfi
     let height = sep.prob.layout.container.outer_orig.bbox().height();
     let item_area = sep.prob.layout.placed_item_area(&sep.instance);
     item_area / (n_target as f32 * sheet.width * height)
+}
+
+/// Shrinks a sampling window so that an item whose **translation** is drawn from it keeps its whole
+/// shape inside the original window.
+///
+/// [`UniformBBoxSampler`] constrains the translation, correcting only `container_bbox` for the
+/// rotated shape's bounding box — its `sample_bbox` argument is used as-is. To make a sample window
+/// mean "the item lands inside this box", the box has to be deflated by the item's extent first.
+///
+/// The deflation is derived from the item's rotated bounding boxes exactly the way the sampler
+/// derives its container range — offset by `-bbox.x_min` on the left and `-bbox.x_max` on the right
+/// — taking the worst case over all allowed rotations so that one window is valid for whichever
+/// rotation is drawn. That is conservative (a given rotation could legally sit closer to an edge),
+/// which is the right trade here: the alternative is a per-rotation window the sampler's API cannot
+/// express.
+///
+/// Returns `None` when the item cannot fit the window at all, which the caller treats as "sample
+/// the raw window and let the separator sort it out".
+fn shrink_bbox_for_item(bbox: Rect, item: &jagua_rs::entities::Item) -> Option<Rect> {
+    use jagua_rs::geometry::Transformation;
+    use jagua_rs::geometry::geo_traits::TransformableFrom;
+    use jagua_rs::geometry::geo_enums::RotationRange;
+    use std::f32::consts::PI;
+
+    // Same rotation grid the sampler uses for continuous rotation.
+    const ROT_N_SAMPLES: usize = 24;
+    let rotations: Vec<f32> = match &item.allowed_rotation {
+        RotationRange::None => vec![0.0],
+        RotationRange::Discrete(r) => r.clone(),
+        RotationRange::Continuous => (0..ROT_N_SAMPLES)
+            .map(|i| i as f32 * (2.0 * PI) / ROT_N_SAMPLES as f32)
+            .collect(),
+    };
+
+    let mut buffer = item.shape_cd.as_ref().clone();
+    // Worst-case offsets over the rotations: how far the shape reaches left/below its origin
+    // (`min_*`, negative-most) and right/above it (`max_*`, positive-most).
+    let (mut lo_x, mut lo_y, mut hi_x, mut hi_y) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for &r in &rotations {
+        let b = buffer.transform_from(item.shape_cd.as_ref(), &Transformation::from_rotation(r)).bbox;
+        lo_x = lo_x.min(b.x_min);
+        lo_y = lo_y.min(b.y_min);
+        hi_x = hi_x.max(b.x_max);
+        hi_y = hi_y.max(b.y_max);
+    }
+    Rect::try_new(bbox.x_min - lo_x, bbox.y_min - lo_y, bbox.x_max - hi_x, bbox.y_max - hi_y).ok()
 }
 
 /// The **sheet-drop / scatter** move: try to make the current solution fit into one sheet fewer.
@@ -505,9 +636,21 @@ fn scatter_and_shrink(
             bbox = Rect::try_new(bbox.x_min, bbox.y_min, bbox.x_min + last_usable, bbox.y_max)
                 .unwrap_or(bbox);
         }
-        // The container is still the *old*, wider one here, so an item sampled inside `bbox` is
-        // trivially inside the container as well.
-        match UniformBBoxSampler::new(bbox, item, sep.prob.layout.container.outer_cd.bbox) {
+        // NOTE on what `bbox` actually constrains. `UniformBBoxSampler` treats its `sample_bbox` as
+        // the range of the **translation** (the item's origin), not as a box the item's *shape* is
+        // kept inside — only `container_bbox` is corrected for the rotated shape's extent. Passing
+        // the raw sheet bbox therefore samples origins across the whole sheet, and an item whose
+        // origin lands near the right edge sticks out well past it, straight onto the next wall.
+        //
+        // Since the point of the scatter is to land items *on a given sheet*, the sampling window is
+        // shrunk here to the set of origins that keep the item inside the sheet, using the same
+        // correction the sampler applies to the container: the widest rotated half-extent. That is a
+        // conservative (rotation-independent) bound, which is what keeps this cheap — the sampler
+        // still intersects per rotation against the container, so nothing leaves the strip either.
+        let sample_bbox = shrink_bbox_for_item(bbox, item).unwrap_or(bbox);
+        // The container is still the *old*, wider one here, so an item sampled inside the shrunken
+        // window is inside the container as well.
+        match UniformBBoxSampler::new(sample_bbox, item, sep.prob.layout.container.outer_cd.bbox) {
             Some(sampler) => {
                 // A uniform random position first — that is what spreads the relocated items over
                 // the *whole* of the surviving sheets rather than over one corner of them...
@@ -842,22 +985,44 @@ pub fn compact_sheets_left(
 
         // Binary search on the shift: the largest collision-free displacement, to within
         // `COMPACT_MIN_SHIFT`. `try_shift` restores the item on failure, so the layout is unchanged
-        // whenever the probe collides.
+        // whenever the probe collides — but *every* probe re-keys the item (`move_item` removes and
+        // re-places it), so `cur_pk` has to be updated from both branches. Dropping the key of the
+        // undo branch used to leave the loop probing a dangling key on its next iteration, which
+        // panics with "invalid SlotMap key used".
         let (mut lo, mut hi) = (0.0f32, max_shift);
-        let mut best_pk = pk;
+        let mut cur_pk = pk;
         let mut best_shift = 0.0f32;
+        // Whether the item currently sits at `best_shift` (true) or back at `dt` (false, after a
+        // failed probe undid itself).
+        let mut at_best = true;
         while hi - lo > COMPACT_MIN_SHIFT {
             let mid = 0.5 * (lo + hi);
-            match try_shift(sep, best_pk, dt, mid) {
-                Some(new_pk) => {
-                    // `mid` works; keep it and try to go further left.
-                    best_pk = new_pk;
-                    best_shift = mid;
-                    lo = mid;
-                }
-                None => hi = mid,
+            let (new_pk, accepted) = try_shift(sep, cur_pk, dt, mid);
+            cur_pk = new_pk;
+            if accepted {
+                // `mid` works; keep it and try to go further left.
+                best_shift = mid;
+                at_best = true;
+                lo = mid;
+            } else {
+                // The probe put the item back at `dt`, i.e. it is no longer at `best_shift`.
+                at_best = false;
+                hi = mid;
             }
         }
+        // The search may well have ended on a *failed* probe, which restored the item to its
+        // original position — so the best accepted shift has to be re-applied before moving on.
+        // Without this the item silently stays put while `n_moved` claims it moved.
+        if best_shift > 0.0 && !at_best {
+            let (new_pk, accepted) = try_shift(sep, cur_pk, dt, best_shift);
+            cur_pk = new_pk;
+            if !accepted {
+                // Should not happen (the same shift was accepted earlier and nothing else moved in
+                // between), but if it does the item is back at `dt` and genuinely did not move.
+                best_shift = 0.0;
+            }
+        }
+        let _ = cur_pk;
         if best_shift > 0.0 {
             n_moved += 1;
         }
@@ -872,17 +1037,21 @@ pub fn compact_sheets_left(
 const COMPACT_MIN_SHIFT: f32 = 0.5;
 
 /// Tries to place the item currently at `pk` at `dt` shifted `shift` mm to the left.
-/// Returns the new key on success (collision-free), or `None` after restoring the original
-/// placement when the shifted position collides with anything.
-fn try_shift(sep: &mut Separator, pk: PItemKey, dt: DTransformation, shift: f32) -> Option<PItemKey> {
+///
+/// Returns `(key, accepted)`: the key the item lives under **after** the probe — which is a *new*
+/// key in both branches, because [`Separator::move_item`] removes and re-places the item and the
+/// undo is itself a `move_item` — and whether the shifted position was collision-free. The caller
+/// must always adopt the returned key: the key it passed in is dangling on return, and reusing it
+/// panics with "invalid SlotMap key used".
+fn try_shift(sep: &mut Separator, pk: PItemKey, dt: DTransformation, shift: f32) -> (PItemKey, bool) {
     let (x, y) = dt.translation();
     let shifted = DTransformation::new(dt.rotation(), (x - shift, y));
     let new_pk = sep.move_item(pk, shifted);
     if sep.ct.get_loss(new_pk) == 0.0 {
-        Some(new_pk)
+        (new_pk, true)
     } else {
-        // Undo: put it back exactly where it was.
-        sep.move_item(new_pk, dt);
-        None
+        // Undo: put it back exactly where it was. This mints yet another key, which is the one the
+        // item is actually reachable under from now on.
+        (sep.move_item(new_pk, dt), false)
     }
 }

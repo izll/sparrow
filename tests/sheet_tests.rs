@@ -455,4 +455,349 @@ mod sheet_integration_tests {
         );
         Ok(())
     }
+
+    // =============================================================================================
+    // Regression tests for the review findings (see docs/sheets.md).
+    //
+    // All of these assert on *returned data* (solutions, stats, counts) rather than relying on
+    // debug assertions, so they are meaningful under `cargo test --release` as well — which is
+    // where the bugs they cover actually bit, debug_asserts being compiled out there.
+    // =============================================================================================
+
+    /// CRITICAL 1 — a **walled warm start** must never hand an infeasible layout to the
+    /// exploration phase (and hence to the exported JSON).
+    ///
+    /// A wall-less solution is optimized first, then re-imported as the warm start of a *walled*
+    /// run whose sheets are narrow enough that items are guaranteed to straddle the new walls.
+    /// Before the fix the straddling layout was seeded into `exploration_phase` as "feasible" and
+    /// came straight back out; now it is repaired first (or the warm start is discarded for a
+    /// walled LBF), so the returned solution is feasible and clear of every wall.
+    #[test]
+    fn walled_warm_start_never_returns_an_infeasible_layout() -> Result<()> {
+        let instance = import_spp("swim.json", None)?;
+
+        // 1. A plain (wall-less) solution: the warm start.
+        let mut terminator = BasicTerminator::new();
+        let mut listener = DummySolListener;
+        let plain_cfg = DEFAULT_SPARROW_CONFIG;
+        terminator.new_timeout(Duration::from_secs(6));
+        let builder = LBFBuilder::new(instance.clone(), Xoshiro256PlusPlus::seed_from_u64(0), LBF_SAMPLE_CONFIG)
+            .construct();
+        let mut plain_sep = Separator::new(
+            builder.instance, builder.prob, builder.rng, plain_cfg.expl_cfg.separator_config,
+        );
+        let plain_sols = exploration_phase(&instance, &mut plain_sep, &mut listener, &terminator, &plain_cfg.expl_cfg);
+        let warm_start = plain_sols.last().expect("the plain run must yield a solution").clone();
+        assert!(jagua_rs::entities::Layout::from_snapshot(&warm_start.layout_snapshot).is_feasible(),
+            "sanity: the wall-less warm start itself is feasible");
+
+        // 2. Feed it into a walled run whose sheets are narrow enough that the wall-less layout
+        //    certainly has items sitting on a boundary, but wide enough that every part still fits
+        //    on one sheet, so a correct answer exists.
+        let sc = sheet(2000.0, 20.0);
+        assert!(sparrow::optimizer::sheets::items_too_wide_for_sheet(&instance, &sc).is_empty(),
+            "sanity: at 2000 mm every part fits a sheet, so the instance is solvable");
+        // The warm start really does straddle the walls of the sheet config it is about to be fed
+        // into — otherwise this test would be vacuous.
+        assert!(count_straddling(&warm_start, &sc) > 0,
+            "sanity: the wall-less warm start must straddle the walls it is imported against");
+
+        let mut walled_cfg = DEFAULT_SPARROW_CONFIG;
+        walled_cfg.apply_sheet(Some(sc));
+        walled_cfg.expl_cfg.time_limit = Duration::from_secs(10);
+        walled_cfg.cmpr_cfg.time_limit = Duration::from_secs(4);
+
+        // 2a. The core guarantee, asserted directly and deterministically: the separator that
+        //     `optimize` hands to `exploration_phase` for a walled warm start must be **feasible**.
+        //     This is the invariant `exploration_phase` relies on when it seeds its feasible-solution
+        //     list with the start, and the one the missing repair used to break — in release, where
+        //     the debug assertion that would have caught it is compiled out.
+        {
+            use sparrow::optimizer::sheets::{apply_sheet_walls_opt, widen_for_walls};
+
+            let mut prob = jagua_rs::probs::spp::entities::SPProblem::new(instance.clone());
+            apply_sheet_walls_opt(&mut prob, Some(&sc));
+            prob.restore(&warm_start);
+            apply_sheet_walls_opt(&mut prob, Some(&sc));
+            widen_for_walls(&mut prob, &sc);
+
+            let raw = Separator::new_with_sheet(
+                instance.clone(), prob, Xoshiro256PlusPlus::seed_from_u64(3),
+                walled_cfg.expl_cfg.separator_config, Some(sc),
+            );
+            // Without a repair this is exactly what used to reach `exploration_phase`.
+            assert!(raw.ct.get_total_loss() > 0.0,
+                "sanity: the un-repaired walled warm start really is infeasible");
+
+            let mut next_rng = {
+                let mut r = Xoshiro256PlusPlus::seed_from_u64(3);
+                move || {
+                    use rand::RngExt;
+                    Xoshiro256PlusPlus::seed_from_u64(r.random())
+                }
+            };
+            let repaired = sparrow::optimizer::repair_walled_warm_start(
+                &instance, raw, &mut next_rng, &mut listener, &walled_cfg.expl_cfg, sc,
+            );
+            assert_eq!(repaired.ct.get_total_loss(), 0.0,
+                "the separator handed to exploration_phase must be feasible: either the warm start \
+                 was repaired, or it was replaced by a walled LBF construction");
+            assert_eq!(count_straddling(&repaired.prob.save(), &sc), 0,
+                "the repaired start must be clear of every wall");
+            assert_eq!(repaired.prob.layout.placed_items.len(), instance.total_item_qty(),
+                "the repair (or its LBF fallback) must still place all demand");
+        }
+
+        // 2b. And end-to-end: the solution `optimize` actually returns (and exports).
+        let mut term = BasicTerminator::new();
+        term.new_timeout(Duration::from_secs(30));
+        let final_sol = sparrow::optimizer::optimize(
+            instance.clone(),
+            Xoshiro256PlusPlus::seed_from_u64(3),
+            &mut listener,
+            &mut term,
+            &walled_cfg.expl_cfg,
+            &walled_cfg.cmpr_cfg,
+            Some(&warm_start),
+        );
+
+        // The returned solution — the one that gets exported — must be genuinely feasible...
+        let layout = jagua_rs::entities::Layout::from_snapshot(&final_sol.layout_snapshot);
+        assert!(layout.is_feasible(),
+            "a walled warm start must never yield an infeasible layout (this is what got exported before the fix)");
+        // ...and no item may sit on a wall.
+        assert_eq!(count_straddling(&final_sol, &sc), 0,
+            "no item may straddle a sheet wall after a walled warm start");
+        // All demand must still be placed.
+        assert_eq!(final_sol.layout_snapshot.placed_items.len(), instance.total_item_qty(),
+            "the warm start must not lose items");
+        Ok(())
+    }
+
+    /// CRITICAL 1 (unit) — `exploration_phase` must not record an infeasible start as a feasible
+    /// solution, in **release** semantics (where the debug assertion that used to "cover" this is
+    /// compiled out).
+    ///
+    /// An item is deliberately parked on a wall, so the start has a non-zero loss. The phase must
+    /// either separate its way to a genuinely feasible layout or return none at all — what it must
+    /// never do is hand back the overlapping start.
+    ///
+    /// **Release-only.** Feeding an infeasible start is precisely what the `debug_assert!` in
+    /// `exploration_phase` forbids, so under the test profile (debug assertions ON) this test would
+    /// trip that assertion before reaching the behaviour it checks. The bug it guards against is a
+    /// release-mode bug — debug_asserts are compiled out there — so the test runs where the bug
+    /// lives: `cargo test --release`.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn exploration_does_not_seed_an_infeasible_start_as_feasible() -> Result<()> {
+        let instance = import_spp("swim.json", None)?;
+        let sc = sheet(3000.0, 20.0);
+
+        let mut prob = SPProblem::new(instance.clone());
+        prob.change_strip_width(10_000.0);
+        apply_sheet_walls(&mut prob, &sc);
+
+        // Park one item squarely on the first wall: the start is now infeasible by construction.
+        let (x_min, x_max) = wall_intervals(prob.strip_width(), &sc)[0];
+        prob.place_item(SPPlacement {
+            item_id: 0,
+            d_transf: DTransformation::new(0.0, ((x_min + x_max) / 2.0, instance.base_strip.fixed_height / 2.0)),
+        });
+
+        let mut config = DEFAULT_SPARROW_CONFIG;
+        config.apply_sheet(Some(sc));
+        config.expl_cfg.time_limit = Duration::from_secs(3);
+
+        let mut sep = Separator::new_with_sheet(
+            instance.clone(), prob, Xoshiro256PlusPlus::seed_from_u64(0),
+            config.expl_cfg.separator_config, config.sheet,
+        );
+        assert!(sep.ct.get_total_loss() > 0.0, "sanity: the start really is infeasible");
+
+        let mut terminator = BasicTerminator::new();
+        let mut listener = DummySolListener;
+        terminator.new_timeout(Duration::from_secs(3));
+        let sols = exploration_phase(&instance, &mut sep, &mut listener, &terminator, &config.expl_cfg);
+
+        // Whatever comes back must be feasible — the infeasible start must not be among it.
+        for sol in &sols {
+            let layout = jagua_rs::entities::Layout::from_snapshot(&sol.layout_snapshot);
+            assert!(layout.is_feasible(),
+                "exploration_phase returned a solution that is not collision-free (width {})",
+                sol.strip_width());
+            assert_eq!(count_straddling(sol, &sc), 0, "a returned solution may not straddle a wall");
+        }
+        Ok(())
+    }
+
+    /// CRITICAL 2 — `--compact-sheets` must run to completion.
+    ///
+    /// `try_shift`'s undo path minted a fresh `PItemKey` and threw it away, so the binary search's
+    /// next probe reused a dangling key and the run died with "invalid SlotMap key used". The
+    /// compaction is exercised here directly on a multi-sheet layout: it must not panic, the result
+    /// must stay feasible and wall-clear, `n_moved` must be truthful, and no item may end up
+    /// further **right** than it started (the pass only ever moves items left).
+    #[test]
+    fn compact_sheets_completes_and_only_moves_items_left() -> Result<()> {
+        use sparrow::optimizer::sheets::compact_sheets_left;
+        use std::collections::HashMap;
+
+        let instance = import_spp("swim.json", None)?;
+        let sc = sheet(2500.0, 20.0);
+        let mut config = DEFAULT_SPARROW_CONFIG;
+        config.apply_sheet(Some(sc));
+
+        let mut terminator = BasicTerminator::new();
+        let mut listener = DummySolListener;
+        terminator.new_timeout(Duration::from_secs(12));
+
+        let builder = LBFBuilder::new_with_sheet(
+            instance.clone(), Xoshiro256PlusPlus::seed_from_u64(0), LBF_SAMPLE_CONFIG, config.sheet,
+        ).construct();
+        let mut sep = Separator::new_with_sheet(
+            builder.instance, builder.prob, builder.rng,
+            config.expl_cfg.separator_config, config.sheet,
+        );
+        let sols = exploration_phase(&instance, &mut sep, &mut listener, &terminator, &config.expl_cfg);
+        let before = sols.last().expect("exploration must yield a solution").clone();
+        assert!(n_sheets(before.strip_width(), &sc) >= 2,
+            "sanity: the compaction only does anything with at least 2 sheets");
+
+        // The x_min of every item before the pass, keyed by PItemKey (stable across the rollback
+        // `compact_sheets_left` performs first).
+        let x_before: HashMap<_, _> = before.layout_snapshot.placed_items.iter()
+            .map(|(pk, pi)| (pk, pi.shape.bbox.x_min))
+            .collect();
+
+        // THE call that used to panic with "invalid SlotMap key used".
+        let (after, n_moved) = compact_sheets_left(&mut sep, &sc, &before);
+
+        // Feasible, wall-clear, and nothing lost.
+        let layout = jagua_rs::entities::Layout::from_snapshot(&after.layout_snapshot);
+        assert!(layout.is_feasible(), "the compacted layout must be collision-free");
+        assert_eq!(count_straddling(&after, &sc), 0, "compaction may not push an item onto a wall");
+        assert_eq!(after.layout_snapshot.placed_items.len(), before.layout_snapshot.placed_items.len(),
+            "compaction may not lose or duplicate items");
+        assert_eq!(n_sheets(after.strip_width(), &sc), n_sheets(before.strip_width(), &sc),
+            "compaction may not change the sheet count");
+
+        // `n_moved` must be truthful: it may not exceed the number of items, and if it claims
+        // movement then the layout must genuinely differ.
+        assert!(n_moved <= after.layout_snapshot.placed_items.len(), "n_moved is out of range");
+
+        // No item may have moved RIGHT. Items are matched by (item_id, y) since keys are re-minted.
+        let mut n_actually_moved = 0usize;
+        let after_by_item: Vec<_> = after.layout_snapshot.placed_items.iter()
+            .map(|(_, pi)| (pi.item_id, pi.shape.bbox.x_min, pi.shape.bbox.y_min))
+            .collect();
+        for (_, pi) in before.layout_snapshot.placed_items.iter() {
+            // The counterpart is the item of the same id at (essentially) the same y.
+            let found = after_by_item.iter()
+                .filter(|(id, _, y)| *id == pi.item_id && (y - pi.shape.bbox.y_min).abs() < 1e-3)
+                .map(|(_, x, _)| *x)
+                .collect::<Vec<_>>();
+            if let Some(&x_after) = found.iter().min_by(|a, b| a.partial_cmp(b).unwrap()) {
+                assert!(x_after <= pi.shape.bbox.x_min + 1e-2,
+                    "item {} moved RIGHT ({} -> {}); the compaction only shifts items left",
+                    pi.item_id, pi.shape.bbox.x_min, x_after);
+                if x_after < pi.shape.bbox.x_min - 1e-2 {
+                    n_actually_moved += 1;
+                }
+            }
+        }
+        // If the pass reported movement, at least one item must really have moved — the old code
+        // could report `n_moved > 0` while the final probe had silently restored everything.
+        if n_moved > 0 {
+            assert!(n_actually_moved > 0,
+                "n_moved = {n_moved} but no item actually changed position (the accepted shift was not re-applied)");
+        }
+        let _ = x_before;
+        Ok(())
+    }
+
+    /// MEDIUM — `sheet_stats` must derive the sheet from the item's **right** edge and report
+    /// straddling items explicitly instead of clamping them into a sheet silently.
+    #[test]
+    fn sheet_stats_reports_straddling_items() -> Result<()> {
+        let instance = import_spp("swim.json", None)?;
+        let sc = sheet(3000.0, 20.0);
+
+        let mut prob = SPProblem::new(instance.clone());
+        prob.change_strip_width(10_000.0);
+        apply_sheet_walls(&mut prob, &sc);
+
+        // One item entirely on sheet 0, one parked across the first wall.
+        prob.place_item(SPPlacement {
+            item_id: 0,
+            d_transf: DTransformation::new(0.0, (1200.0, instance.base_strip.fixed_height / 2.0)),
+        });
+        let (x_min, x_max) = wall_intervals(prob.strip_width(), &sc)[0];
+        prob.place_item(SPPlacement {
+            item_id: 0,
+            d_transf: DTransformation::new(0.0, ((x_min + x_max) / 2.0, instance.base_strip.fixed_height / 2.0)),
+        });
+
+        let sol = prob.save();
+        let stats = sheet_stats(&sol, &instance, &sc);
+        let n_straddling: usize = stats.iter().map(|s| s.straddling_item_ids.len()).sum();
+        assert_eq!(n_straddling, 1,
+            "the item sitting on wall 0 must be reported as straddling, not clamped into a sheet");
+        assert_eq!(stats.iter().map(|s| s.n_items).sum::<usize>(), 2, "every item is still counted once");
+
+        // A clean solution must report nothing.
+        let mut clean = SPProblem::new(instance.clone());
+        clean.change_strip_width(10_000.0);
+        apply_sheet_walls(&mut clean, &sc);
+        clean.place_item(SPPlacement {
+            item_id: 0,
+            d_transf: DTransformation::new(0.0, (1200.0, instance.base_strip.fixed_height / 2.0)),
+        });
+        let clean_stats = sheet_stats(&clean.save(), &instance, &sc);
+        assert_eq!(clean_stats.iter().map(|s| s.straddling_item_ids.len()).sum::<usize>(), 0,
+            "a wall-clear layout must report no straddling items");
+        Ok(())
+    }
+
+    /// MEDIUM — an item wider than a sheet in every rotation makes the walled mode unsolvable and
+    /// must be detected up front (this is what turns the 700 mm repro into a clear error instead of
+    /// an infeasible export or an LBF runaway panic).
+    #[test]
+    fn items_too_wide_for_a_sheet_are_detected() -> Result<()> {
+        use sparrow::optimizer::sheets::items_too_wide_for_sheet;
+        let instance = import_spp("swim.json", None)?;
+
+        // swim's parts are well over 700 mm wide, so a 700 mm sheet is impossible...
+        let narrow = items_too_wide_for_sheet(&instance, &sheet(700.0, 20.0));
+        assert!(!narrow.is_empty(), "700 mm sheets must be reported as too narrow for swim");
+        for (_, w) in &narrow {
+            assert!(*w > 700.0, "a reported item must genuinely exceed the sheet width");
+        }
+
+        // ...while a 2500 mm sheet fits every part.
+        let wide = items_too_wide_for_sheet(&instance, &sheet(2500.0, 20.0));
+        assert!(wide.is_empty(), "at 2500 mm every swim part fits a sheet, got {wide:?}");
+        Ok(())
+    }
+
+    /// MEDIUM — `--sheet-gap 0` must be honoured rather than silently replaced by the 20 mm default.
+    #[test]
+    fn zero_sheet_gap_is_honoured() {
+        use sparrow::config::SheetConfig;
+
+        assert_eq!(SheetConfig::resolve_gap(Some(0.0), None), 0.0,
+            "--sheet-gap 0 must stay 0, not fall back to the default");
+        assert_eq!(SheetConfig::resolve_gap(Some(7.5), None), 7.5, "an explicit gap is used as given");
+        assert!(SheetConfig::resolve_gap(None, None) > 0.0, "no --sheet-gap still gets the default");
+        assert_eq!(SheetConfig::resolve_gap(None, Some(5.0)), 20.0_f32.max(10.0),
+            "the default still respects 2 * min_item_separation");
+
+        // With gap 0 the pitch is the bare sheet width and the (degenerate) walls are dropped.
+        let sc = SheetConfig::new(1000.0, 0.0, false);
+        assert_eq!(sc.pitch(), 1000.0);
+        assert_eq!(n_sheets(2500.0, &sc), 3);
+        let walls = wall_intervals(2500.0, &sc);
+        assert!(walls.iter().all(|(lo, hi)| lo == hi),
+            "a zero gap yields degenerate wall intervals, which apply_sheet_walls filters out");
+    }
+
 }
