@@ -88,11 +88,14 @@ mod fit_parity_tests {
     #[test]
     fn min_sep_resolution_prefers_cli_then_env_then_default() {
         // (the env var is process-global; only exercise the CLI/default paths here)
-        assert_eq!(resolve_min_item_separation(Some(5.0), None), Some(5.0));
-        assert_eq!(resolve_min_item_separation(Some(0.0), Some(3.0)), None, "non-positive CLI value disables the separation");
+        // The resolver returns a `Result` now: a non-finite value is an error rather than a
+        // silent "separation disabled" (a NaN fails every `v > 0.0` test).
+        assert_eq!(resolve_min_item_separation(Some(5.0), None).unwrap(), Some(5.0));
+        assert_eq!(resolve_min_item_separation(Some(0.0), Some(3.0)).unwrap(), None, "non-positive CLI value disables the separation");
+        assert!(resolve_min_item_separation(Some(f32::NAN), Some(3.0)).is_err(), "a NaN must be an error, not a silent opt-out");
         if std::env::var("SPARROW_MIN_SEP").is_err() {
-            assert_eq!(resolve_min_item_separation(None, Some(3.0)), Some(3.0));
-            assert_eq!(resolve_min_item_separation(None, None), None);
+            assert_eq!(resolve_min_item_separation(None, Some(3.0)).unwrap(), Some(3.0));
+            assert_eq!(resolve_min_item_separation(None, None).unwrap(), None);
         }
     }
 }

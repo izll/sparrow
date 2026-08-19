@@ -23,6 +23,7 @@ use sparrow::util::bpp_io::{self, BPSolutionListener, BPSvgExporter, BppCli, Ext
 use sparrow::util::ctrlc_terminator::CtrlCTerminator;
 use sparrow::util::io;
 use sparrow::util::listener::ReportType;
+use sparrow::util::verify;
 use std::cmp::Ordering;
 use std::fs;
 use std::path::Path;
@@ -31,6 +32,10 @@ use std::time::Duration;
 pub const OUTPUT_DIR: &str = "output";
 
 pub const LIVE_DIR: &str = "data/live";
+
+/// Largest total demand accepted, mirroring the SPP binary's cap. See `sparrow`'s
+/// `MAX_TOTAL_DEMAND`.
+pub const MAX_TOTAL_DEMAND: u64 = 1_000_000;
 
 fn main() -> Result<()> {
     let mut config: BPConfig = DEFAULT_BPP_CONFIG;
@@ -108,9 +113,18 @@ fn main() -> Result<()> {
 
     let (ext_instance, ext_solution) = bpp_io::read_bpp_input(Path::new(&input_file_path), &args.bins)?;
 
+    // See `sparrow::MAX_TOTAL_DEMAND` on the SPP side: the BPP LBF constructor materialises one
+    // `Vec` element per demanded copy too, so a huge demand is an allocation, not a number.
+    let total_demand: u64 = ext_instance.items.iter().map(|it| it.demand).sum();
+    if total_demand > MAX_TOTAL_DEMAND {
+        bail!("the instance demands {total_demand} items, more than the supported maximum of \
+               {MAX_TOTAL_DEMAND}; every copy is materialised individually, so this would exhaust \
+               memory before the first placement");
+    }
+
     // Minimum item separation: --min-sep > SPARROW_MIN_SEP env var > config default (shared with the SPP binary,
     // so both engines apply exactly the same inflation/deflation to identical inputs).
-    let min_sep = sparrow::util::io::resolve_min_item_separation(args.min_item_separation, config.min_item_separation);
+    let min_sep = sparrow::util::io::resolve_min_item_separation(args.min_item_separation, config.min_item_separation)?;
     config.min_item_separation = min_sep;
     if let Some(sep) = min_sep {
         info!("[MAIN] minimum item separation: {sep} (items inflated and bins deflated by {} each)", sep / 2.0);
@@ -128,19 +142,12 @@ fn main() -> Result<()> {
         info!("[MAIN] warm start solution: {}", bpp_io::summarize(init_sol, &instance));
 
         // A warm start is fed straight into `BPProblem::restore`, which does not (and cannot)
-        // invent placements for missing demand. An incomplete solution would therefore be
-        // optimized — and written out — with items silently missing, so reject it here.
-        let n_placed: usize = init_sol.layout_snapshots.values().map(|ls| ls.placed_items.len()).sum();
-        if n_placed != instance.total_item_qty() {
-            bail!("the warm start solution places {n_placed} item(s) but the instance demands {}; \
-                   it does not cover the full demand", instance.total_item_qty());
-        }
-        // Likewise, `restore` trusts the snapshots: verify they are actually collision-free.
-        for (lkey, ls) in init_sol.layout_snapshots.iter() {
-            if !jagua_rs::entities::Layout::from_snapshot(ls).is_feasible() {
-                bail!("layout {lkey:?} of the warm start solution is not collision-free");
-            }
-        }
+        // invent placements for missing demand, nor reject extra ones. The check is **per item
+        // id**, not on the total: a solution that places two copies of item 3 and none of item 4
+        // has the right total and is still wrong. `verify_bpp_solution` also re-checks
+        // collision-freedom (`restore` trusts its snapshots) and the bin stock.
+        verify::verify_bpp_solution(init_sol, &instance, "the warm start solution")
+            .context("the warm start solution given with -i is not usable")?;
     }
 
     let final_svg_path = format!("{OUTPUT_DIR}/final_{}.svg", ext_instance.name);
@@ -214,22 +221,23 @@ fn main() -> Result<()> {
         // Only feasible runs may be selected. An infeasible solution packs into *fewer* bins exactly
         // because its parts overlap, so selecting on cost alone systematically prefers the broken
         // run over the correct ones.
+        // The gate is the full export gate (demand per item id, feasibility, bin stock), not just
+        // `is_feasible()`: a run that lost items packs into *fewer* bins precisely because it lost
+        // them, so a cost-only selection prefers it over every correct run.
         let mut feasible = vec![];
         for (run_idx, sol) in solutions.into_iter() {
-            let bad = sol.layout_snapshots.iter()
-                .find(|(_, ls)| !jagua_rs::entities::Layout::from_snapshot(ls).is_feasible())
-                .map(|(lkey, _)| lkey);
+            let verdict = verify::verify_bpp_solution(&sol, &instance, "the solution");
             info!("[MAIN] run {} (seed {}): {}{}", run_idx, seed + run_idx as u64,
                 bpp_io::summarize(&sol, &instance),
-                if bad.is_none() { String::new() } else { format!("  <-- INFEASIBLE ({:?}), excluded", bad.unwrap()) });
-            match bad {
-                None => feasible.push((run_idx, sol)),
-                Some(lkey) => warn!("[MAIN] run {} (seed {}) produced an infeasible layout ({lkey:?}) and is excluded from the selection",
+                match &verdict { Ok(()) => String::new(), Err(e) => format!("  <-- REJECTED: {e}") });
+            match verdict {
+                Ok(()) => feasible.push((run_idx, sol)),
+                Err(e) => warn!("[MAIN] run {} (seed {}) produced an unusable solution and is excluded from the selection: {e}",
                     run_idx, seed + run_idx as u64),
             }
         }
         if feasible.is_empty() {
-            bail!("all {} parallel runs produced infeasible layouts; nothing to export", n_runs);
+            bail!("all {} parallel runs produced unusable solutions; nothing to export", n_runs);
         }
         // Best = lowest cost, ties broken by the **lowest density of the least dense bin**: at equal
         // bin count the useful result is the one whose leftover material is concentrated in a single
@@ -251,6 +259,13 @@ fn main() -> Result<()> {
     };
 
     info!("[MAIN] final solution: {}", bpp_io::summarize(&solution, &instance));
+
+    // **The export gate**, the BPP twin of the SPP one in `main.rs`: nothing downstream can tell a
+    // good JSON from a bad one, so the answer is fully re-verified (exact demand per item id,
+    // per-layout collision-freedom, bin stock) immediately before the file is written. On failure
+    // nothing is written and the process exits 1.
+    verify::verify_bpp_solution(&solution, &instance, "the final solution")
+        .context("refusing to export")?;
 
     let json_path = format!("{OUTPUT_DIR}/final_{}.json", ext_instance.name);
     let json_output = ExtBPOutput {

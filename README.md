@@ -119,7 +119,15 @@ cargo run --release -- \
 
 The number of sheets is `ceil(width / (sheet-width + gap))`, so minimising the strip width minimises
 the sheet count as a direct consequence. `--sheet-gap` sets the (virtual, material-free) wall
-thickness; it defaults to `max(20, 2 * min-sep)`. Without `--sheet-width` behaviour is unchanged.
+thickness; it defaults to `max(20, 2 * min-sep)` and must be **at least 1 mm** — a wall is a
+rectangular collision hazard, and a zero-width one cannot be represented, so it would be dropped and
+items would be free to straddle the sheet boundaries. The gap costs no material (the sheets are
+separate physical objects), so there is never a reason to ask for less. Without `--sheet-width`
+behaviour is unchanged.
+
+Before the JSON is written, the solution is re-verified: the full demand must be placed, the layout
+must be collision-free, and no item may straddle a sheet wall. A run that cannot satisfy all three
+exits `1` and writes nothing rather than exporting a layout that cannot be cut.
 
 A per-sheet report is logged, including the **reusable leftover band** of each sheet:
 
@@ -180,6 +188,29 @@ cargo run --release --features=only_final_svg -- \
     -i data/input/swim.json
 ```
 The final solution is saved both in SVG and JSON format in `output/final_{name}.svg` and `output/final_{name}.json`, respectively.
+
+## Determinism and reproducibility
+
+Both phases stop on **wall-clock time**, not on an iteration count. That makes the *result* of a run
+non-deterministic even with a fixed `-s` seed: a machine that is faster (or merely less loaded)
+completes more iterations in the same budget and lands somewhere else. Three repeats of the identical
+`swim -e 10 -c 5 -s 0` command gave final widths of 5837.700 / 5837.811 / 5834.733.
+
+What *is* deterministic, for a fixed seed and worker count, is the search itself: worker results are
+merged in worker-index order, per-worker RNGs are derived from the master RNG, and no iteration order
+depends on a `HashMap`. Two builds of differing speed therefore produce an **identical shrink-step
+prefix** — the same sequence of widths for as many steps as both manage — and diverge only because
+the faster one takes more steps. Claims of bit-identical *runs* would require an iteration-based
+terminator, which the CLI does not expose.
+
+Practical consequences:
+
+* to compare two builds or two settings, fix `-s` and average over several runs, or compare the
+  shrink-step prefixes rather than the final widths;
+* `-p N` adds a second source of variation — the parallel runs compete for CPU, so which seed wins
+  can differ between invocations of the same command;
+* `SPARROW_N_WORKERS` changes the search, not just its speed; results across different worker counts
+  are not comparable.
 
 ## Targeting maximum performance
 

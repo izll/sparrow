@@ -260,8 +260,9 @@ any other width. `best_width` starts at `+inf` in that case so the first solutio
 is recorded, and the phase may legitimately return an **empty** list if it never reaches feasibility;
 `optimize` handles that.
 
-For a feasible start this is bit-identical to the previous behaviour (the check passes, the start is
-seeded, no RNG is touched), so plain SPP is unaffected.
+For a feasible start this is behaviourally identical to the previous code (the check passes, the
+start is seeded, no RNG is touched), so plain SPP is unaffected: the exploration produces the same
+shrink-step sequence for the same number of iterations.
 
 ## Phase 8: cross-sheet relocation
 
@@ -533,11 +534,20 @@ With `sheet = None` the behaviour is unchanged:
 
 * `CollisionTracker` allocates an *empty* `hole_collisions` vec (`size * 0`), and every hole loop is
   a no-op, so there is no extra work in the hot paths;
-* the deterministic exploration phase on `swim.json -e 10 -c 5 -s 0` is **bit-identical** before and
-  after the change, matching at every shrink step down to 5854.934 @ 75.555 %;
-* the compression phase is wall-clock-paced and therefore *inherently* non-deterministic — three runs
-  of the same unmodified binary with the same seed gave 5836.49 / 5840.47 / 5836.76. The before
-  (5838.74) and after (5839.16) figures both sit inside that spread;
-* the deterministic plain-SPP exploration on `swim.json -e 10 -c 5 -s 0` is **bit-identical** across
-  phase 7 and phase 8: 149 shrink steps, ending at the same 5854.934 → 5849.079;
+* the exploration phase on `swim.json -e 10 -c 5 -s 0` produces an **identical shrink-step prefix**
+  before and after the change: for as many shrink steps as both runs perform, every width matches to
+  the printed precision. What it is *not* is a bit-identical whole run, and the difference matters.
+  The exploration phase is **wall-clock-limited**, not iteration-limited, so a faster build simply
+  gets further in the same ten seconds: an independent audit measured 132 shrink steps (ending at
+  5949.413) for upstream `961ec31` against 148 (ending at 5854.934) for this fork, with the first
+  132 agreeing exactly. Nothing drifted — the fork is roughly 2x faster per evaluation and therefore
+  runs 16 more steps. Full bit-identity can only be claimed against a **fixed-iteration** terminator,
+  which the CLI does not currently expose;
+* the compression phase is wall-clock-paced for the same reason and is therefore *inherently*
+  non-deterministic — three runs of the same unmodified binary with the same seed gave
+  5836.49 / 5840.47 / 5836.76. The before (5838.74) and after (5839.16) figures both sit inside that
+  spread. The same applies to `-p`: the parallel runs compete for CPU, so which one wins can vary
+  between invocations of the identical command;
+* the plain-SPP exploration on `swim.json -e 10 -c 5 -s 0` has an identical shrink-step prefix
+  across phase 7 and phase 8 (149 steps in both, ending at the same 5854.934 → 5849.079);
 * all 38 tests across the whole suite pass, BPP included.

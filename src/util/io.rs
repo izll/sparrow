@@ -36,21 +36,24 @@ pub struct MainCli {
     pub rng_seed: Option<u64>,
 
     /// Minimum separation between items and between items and the container edge (mm)
-    #[arg(long = "min-sep", value_name = "MM", help = "Minimum distance between items and between items and the container edge (mm). \
+    #[arg(long = "min-sep", value_name = "MM", value_parser = parse_non_negative_f32,
+        help = "Minimum distance between items and between items and the container edge (mm). \
                 Items are inflated and the container is deflated by half this value each. Overrides the SPARROW_MIN_SEP env var")]
     pub min_item_separation: Option<f32>,
 
     /// Usable width of one physical sheet (mm). Enables the multi-sheet ("walled") strip mode.
-    #[arg(long = "sheet-width", value_name = "MM", help = "Enable multi-sheet (walled) strip packing: insert a wall at every multiple of this sheet width (mm), \
+    #[arg(long = "sheet-width", value_name = "MM", value_parser = parse_positive_f32,
+        help = "Enable multi-sheet (walled) strip packing: insert a wall at every multiple of this sheet width (mm), \
                 so no item ever straddles a sheet boundary. The strip can then be cut into physical sheets of this width directly. \
                 Without this flag the behaviour is the plain strip packing one")]
     pub sheet_width: Option<f32>,
 
     /// Thickness of the virtual wall between two consecutive sheets (mm)
-    #[arg(long = "sheet-gap", value_name = "MM", requires = "sheet_width",
+    #[arg(long = "sheet-gap", value_name = "MM", requires = "sheet_width", value_parser = parse_sheet_gap,
         help = "Thickness of the (virtual) wall between two consecutive sheets (mm). The sheets are separate physical objects, \
                 so this costs no material; a thicker wall gives the separator a better gradient to push items off a boundary. \
-                Defaults to max(20, 2 * min-sep)")]
+                Must be at least 1 mm: a zero-width wall is not representable as a collision hazard and would be dropped, \
+                letting items straddle the sheet boundaries. Defaults to max(20, 2 * min-sep)")]
     pub sheet_gap: Option<f32>,
 
     /// Compact each sheet's items to the left within their own sheet after compression
@@ -85,16 +88,87 @@ pub struct MainCli {
 /// Environment variable read as a fallback for `--min-sep` (used by callers that cannot pass CLI flags).
 pub const MIN_SEP_ENV_VAR: &str = "SPARROW_MIN_SEP";
 
+/// Smallest wall thickness `--sheet-gap` accepts (mm).
+///
+/// A wall is modelled as a [`Hole`](jagua_rs::collision_detection::hazards::HazardEntity::Hole)
+/// hazard built from a `Rect`, and a rectangle of zero width is not representable: `Rect::try_new`
+/// rejects it, so the wall is silently *dropped* and nothing stops an item from straddling the
+/// boundary. A run with `--sheet-gap 0` therefore looked like a walled run but was a plain strip
+/// run whose export could not be cut into sheets at all. The gap is virtual (the sheets are
+/// separate physical objects, so it costs no material), so requiring at least 1 mm of it costs
+/// nothing and keeps the wall a real geometric obstacle.
+pub const MIN_SHEET_GAP: f32 = 1.0;
+
+/// Shared `clap` value parser for every floating point CLI argument of both binaries.
+///
+/// Rejects `NaN` and `±inf`, which `f32::from_str` happily accepts and which then propagate through
+/// the whole pipeline: `--sheet-width NaN` aborted inside jagua, `--sheet-width inf` produced an
+/// export full of `NaN`/`Infinity` metrics, and `--min-sep NaN` silently *disabled* the separation
+/// (every `v > 0.0` comparison with a NaN is false). A `clap` parse error exits with code 2.
+pub fn parse_finite_f32(s: &str) -> Result<f32, String> {
+    let v: f32 = s.trim().parse().map_err(|_| format!("`{s}` is not a number"))?;
+    match v.is_finite() {
+        true => Ok(v),
+        false => Err(format!("`{s}` is not a finite number")),
+    }
+}
+
+/// [`parse_finite_f32`] plus a `> 0` requirement (`--sheet-width`).
+pub fn parse_positive_f32(s: &str) -> Result<f32, String> {
+    let v = parse_finite_f32(s)?;
+    match v > 0.0 {
+        true => Ok(v),
+        false => Err(format!("`{s}` must be greater than 0")),
+    }
+}
+
+/// [`parse_finite_f32`] plus a `>= 0` requirement (`--min-sep`).
+pub fn parse_non_negative_f32(s: &str) -> Result<f32, String> {
+    let v = parse_finite_f32(s)?;
+    match v >= 0.0 {
+        true => Ok(v),
+        false => Err(format!("`{s}` must not be negative")),
+    }
+}
+
+/// [`parse_finite_f32`] plus the `>= MIN_SHEET_GAP` requirement (`--sheet-gap`).
+///
+/// See [`MIN_SHEET_GAP`] for why zero is not accepted.
+pub fn parse_sheet_gap(s: &str) -> Result<f32, String> {
+    let v = parse_finite_f32(s)?;
+    match v >= MIN_SHEET_GAP {
+        true => Ok(v),
+        false => Err(format!(
+            "`{s}` is too thin: a sheet wall must be at least {MIN_SHEET_GAP} mm wide. A zero-width \
+             wall is not representable as a collision hazard, so it would be dropped and items \
+             would be free to straddle the sheet boundaries. The gap is virtual (the sheets are \
+             separate physical objects), so it costs no material"
+        )),
+    }
+}
+
 /// Resolves the minimum item separation to use: CLI flag > `SPARROW_MIN_SEP` env var > config default.
 /// Non-positive values disable the separation. Both binaries (`sparrow`, `sparrow-bpp`) use this, so an identical
 /// input yields an identical fit/no-fit verdict regardless of the problem type.
-pub fn resolve_min_item_separation(cli_value: Option<f32>, config_default: Option<f32>) -> Option<f32> {
-    let env_value = std::env::var(MIN_SEP_ENV_VAR).ok().and_then(|v| v.trim().parse::<f32>().ok());
-    match cli_value.or(env_value) {
+///
+/// Returns `Err` for a non-finite value: a `NaN` reaching this function used to fall through every
+/// `v > 0.0` test and *silently disable* the separation the caller explicitly asked for.
+pub fn resolve_min_item_separation(cli_value: Option<f32>, config_default: Option<f32>) -> Result<Option<f32>> {
+    let env_raw = std::env::var(MIN_SEP_ENV_VAR).ok();
+    let env_value = match env_raw.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        Some(raw) => match raw.parse::<f32>() {
+            Ok(v) if v.is_finite() => Some(v),
+            _ => anyhow::bail!("{MIN_SEP_ENV_VAR}={raw:?} is not a finite number"),
+        },
+        None => None,
+    };
+    let resolved = match cli_value.or(env_value) {
+        Some(v) if !v.is_finite() => anyhow::bail!("the minimum item separation ({v}) is not a finite number"),
         Some(v) if v > 0.0 => Some(v),
         Some(_) => None,
         None => config_default,
-    }
+    };
+    Ok(resolved)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -169,6 +243,69 @@ pub fn write_json(json: &impl Serialize, path: &Path, log_lvl: Level) -> Result<
             .to_str()
             .unwrap()
     );
+    Ok(())
+}
+
+/// Validates an SPP warm-start solution **before** it is handed to
+/// [`jagua_rs::probs::spp::io::import_solution`], which trusts its input completely.
+///
+/// The import indexes `instance.items` with the raw `item_id` and calls `place_item` for every
+/// placement, so an unknown id, an over-placed item or a negative strip width all reach jagua as an
+/// index-out-of-bounds / `usize` underflow / invalid-`Rect` **panic**. With `panic = "abort"` in the
+/// release profile that is exit code `134` and a stack trace, where the user gave a merely malformed
+/// file.
+///
+/// Checked here (all of it cheap, on the external representation):
+/// * the strip width is finite and `> 0`;
+/// * every `item_id` exists in the instance;
+/// * every transformation is finite;
+/// * the per-item-id placement counts match the demand **exactly**.
+///
+/// The last one is not merely defensive. `SPProblem::restore` cannot invent placements for missing
+/// demand and does not reject extra ones, so an incomplete warm start used to be optimized and
+/// exported with items silently missing (measured: demand 2, one placement, exit `0`, one item in
+/// the output), and an over-complete one exported with items duplicated.
+pub fn validate_spp_warm_start(ext_instance: &ExtSPInstance, ext_solution: &ExtSPSolution) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let width = ext_solution.strip_width;
+    if !width.is_finite() || width <= 0.0 {
+        anyhow::bail!("the warm start solution has an invalid strip width ({width}); it must be finite and > 0");
+    }
+
+    let demand: BTreeMap<u64, u64> = ext_instance.items.iter()
+        .map(|it| (it.base.id, it.demand))
+        .collect();
+
+    let mut placed: BTreeMap<u64, u64> = BTreeMap::new();
+    for (idx, pi) in ext_solution.layout.placed_items.iter().enumerate() {
+        if !demand.contains_key(&pi.item_id) {
+            anyhow::bail!("the warm start solution places an unknown item id {} (placement #{idx}); \
+                           the instance defines item id(s) {:?}",
+                pi.item_id, demand.keys().collect::<Vec<_>>());
+        }
+        let t = &pi.transformation;
+        if !t.rotation.is_finite() || !t.translation.0.is_finite() || !t.translation.1.is_finite() {
+            anyhow::bail!("the warm start solution has a non-finite transformation for item {} (placement #{idx})", pi.item_id);
+        }
+        *placed.entry(pi.item_id).or_insert(0) += 1;
+    }
+
+    if placed != demand {
+        let mut ids: Vec<u64> = demand.keys().chain(placed.keys()).copied().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let detail = ids.into_iter()
+            .filter_map(|id| {
+                let (p, d) = (placed.get(&id).copied().unwrap_or(0), demand.get(&id).copied().unwrap_or(0));
+                (p != d).then(|| format!("item {id}: placed {p}, demanded {d}"))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("the warm start solution does not cover the instance demand exactly ({detail}); \
+                       a warm start is restored as-is, so a missing or extra placement would be \
+                       carried straight through to the exported solution");
+    }
     Ok(())
 }
 

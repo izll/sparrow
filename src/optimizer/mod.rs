@@ -113,14 +113,34 @@ pub fn optimize(
     );
     // `exploration_phase` returns an empty list only when it started from an infeasible layout and
     // never separated its way to a feasible one. Every start built here is repaired first (walled
-    // warm start, plain-first pre-pass) or feasible by construction (LBF), so falling back to the
-    // separator's current layout is a belt-and-braces path rather than an expected one.
+    // warm start, plain-first pre-pass) or feasible by construction (LBF), so this should not
+    // happen — but when it did, the old code **continued from the separator's current, overlapping
+    // layout** with a warning, and that layout was then compressed, returned and exported at exit
+    // `0`. Measured from an overlapping warm start with a zero-second budget: 1 185 179.5 mm² of
+    // overlap in the output JSON.
+    //
+    // An infeasible layout is not a worse answer, it is a wrong one, and the caller has no way to
+    // tell it apart from a good one. Repair it here with a full separation instead, and let the
+    // caller's export gate (`util::verify`) refuse the run outright if even that fails.
     let final_explore_sol = match solutions.last() {
         Some(sol) => sol.clone(),
         None => {
             warn!("[OPT] the exploration phase never reached a feasible solution; \
-                   continuing from its final (possibly infeasible) layout");
-            expl_separator.prob.save()
+                   attempting a final repair separation before handing over to the compression phase");
+            let mut repair_term = BasicTerminator::new();
+            repair_term.new_timeout(expl_config.time_limit.mul_f32(WALL_REPAIR_BUDGET_RATIO));
+            let outer_cfg = expl_separator.config;
+            expl_separator.config.strike_limit = outer_cfg.strike_limit.max(WALL_REPAIR_STRIKE_LIMIT);
+            expl_separator.config.iter_no_imprv_limit = outer_cfg.iter_no_imprv_limit.max(WALL_REPAIR_ITER_NO_IMPRV_LIMIT);
+            let (repaired, ct) = expl_separator.separate(&repair_term, sol_listener);
+            expl_separator.rollback(&repaired, Some(&ct));
+            expl_separator.config = outer_cfg;
+            if ct.get_total_loss() != 0.0 {
+                warn!("[OPT] the repair separation did not reach zero loss (min loss {}); the run \
+                       cannot produce a feasible solution and will be rejected by the export gate",
+                    crate::FMT().fmt2(ct.get_total_loss()));
+            }
+            repaired
         }
     };
     if let Some(sheet) = expl_config.sheet.as_ref() {

@@ -40,6 +40,31 @@ Workers on a **single core** (`taskset -c 0`, emulating a single-threaded build 
 
 Best-of-3 orderings per iteration beats 3× more iterations with one ordering, even at equal CPU time.
 
+## What the speed-up does and does not preserve
+
+Both phases stop on **wall-clock time**, not on an iteration count, so a faster build does not
+reproduce the slower build's run — it does *more* of it. Comparing this fork with upstream
+`961ec31` on `swim -e 10 -c 5 -s 0` with 3 workers, an independent audit measured 132 shrink steps
+(final exploration width 5949.413) upstream against 148 (5854.934) here, with the **first 132 steps
+identical to the printed precision**. That is the correct claim to make: an *identical shrink-step
+prefix for equal iteration counts*, not a bit-identical run. A wall-clock-limited run of a faster
+build necessarily differs, and here it differs by being better.
+
+Consequently:
+
+* the same command with the same `-s` seed run twice will generally **not** give the same final
+  width — three repeats of seed 0 gave 5837.700 / 5837.811 / 5834.733;
+* the exploration phase's shrink-step count is itself a function of machine speed and load;
+* `-p N` adds a second source of variation: the parallel runs compete for CPU, so which seed wins
+  can change between invocations;
+* to compare two builds or two configurations meaningfully, fix the seed **and** average over
+  several runs, or compare the shrink-step prefixes rather than the final numbers.
+
+Determinism for a fixed seed *and* a fixed iteration count holds (worker results merge in
+worker-index order, per-worker RNGs derive from the master RNG, and no iteration order depends on a
+`HashMap`), but the CLI exposes no iteration-based terminator, so it cannot be demonstrated
+end-to-end today.
+
 ## Reproducing
 
 ```bash

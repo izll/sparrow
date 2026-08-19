@@ -138,27 +138,33 @@ impl SheetConfig {
         self.width + self.gap
     }
 
-    /// Resolves the gap to use: **any** explicit CLI value if given (including `0`), otherwise
+    /// Resolves the gap to use: the explicit CLI value if given, otherwise
     /// `max(MIN_DEFAULT_SHEET_GAP, 2 * min_item_separation)`.
     ///
-    /// `--sheet-gap 0` is a legitimate request — sheets butt up against each other with no kerf —
-    /// and used to be swallowed by the `g > 0.0` guard, silently substituting the 20 mm default and
-    /// producing a layout laid out on a pitch the caller never asked for. It is honoured now, with a
-    /// warning: a zero-width wall cannot separate the sheets geometrically, so an item may sit
-    /// exactly on a boundary and the cut has no kerf allowance.
-    pub fn resolve_gap(cli_gap: Option<f32>, min_item_separation: Option<f32>) -> f32 {
+    /// Returns `Err` for a gap thinner than [`crate::util::io::MIN_SHEET_GAP`] (which includes
+    /// `0` and any negative value) and for a non-finite one.
+    ///
+    /// `--sheet-gap 0` used to be honoured with only a warning, on the theory that "sheets butt up
+    /// against each other with no kerf" is a legitimate request. It is not representable: a wall is
+    /// a `Rect`-shaped [`Hole`](jagua_rs::collision_detection::hazards::HazardEntity::Hole) hazard,
+    /// `Rect::try_new` rejects a degenerate rectangle, and
+    /// [`apply_sheet_walls`](crate::optimizer::sheets::apply_sheet_walls) therefore *filtered the
+    /// walls out entirely*. The run then looked walled but was a plain strip run: measured on a
+    /// 6-item instance at `--sheet-width 100 --sheet-gap 0`, two items straddled a boundary, the
+    /// binary exited 0 and wrote the JSON anyway. Reject it at the CLI instead.
+    pub fn resolve_gap(cli_gap: Option<f32>, min_item_separation: Option<f32>) -> anyhow::Result<f32> {
+        let default = MIN_DEFAULT_SHEET_GAP.max(2.0 * min_item_separation.unwrap_or(0.0));
         match cli_gap {
-            Some(g) if g > 0.0 => g,
-            Some(0.0) => {
-                log::warn!("[CFG] --sheet-gap 0: the sheet boundaries get zero-width walls, so items \
-                            may touch a boundary exactly and the cut has no kerf allowance");
-                0.0
-            }
-            Some(g) => {
-                log::warn!("[CFG] ignoring a negative --sheet-gap ({g}); using the default instead");
-                MIN_DEFAULT_SHEET_GAP.max(2.0 * min_item_separation.unwrap_or(0.0))
-            }
-            None => MIN_DEFAULT_SHEET_GAP.max(2.0 * min_item_separation.unwrap_or(0.0)),
+            Some(g) if !g.is_finite() => anyhow::bail!("--sheet-gap {g} is not a finite number"),
+            Some(g) if g < crate::util::io::MIN_SHEET_GAP => anyhow::bail!(
+                "--sheet-gap {g} is too thin: a sheet wall must be at least {} mm wide. A wall is a \
+                 rectangular collision hazard and a zero-width one is not representable, so it would \
+                 be silently dropped and items would be free to straddle the sheet boundaries. The \
+                 gap is virtual — the sheets are separate physical objects — so it costs no material",
+                crate::util::io::MIN_SHEET_GAP,
+            ),
+            Some(g) => Ok(g),
+            None => Ok(default),
         }
     }
 }

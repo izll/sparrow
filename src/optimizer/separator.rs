@@ -115,7 +115,14 @@ impl Separator {
             let initial_strike_loss = self.ct.get_total_loss();
             debug!("[SEP] [s:{n_strikes},i:{n_iter}]     init_l: {}",FMT().fmt2(initial_strike_loss));
 
-            while n_iter_no_improvement < self.config.iter_no_imprv_limit {
+            // The terminator is checked on **every** iteration, not just once per strike. The outer
+            // `'outer` loop's check alone let a strike run to completion after the deadline had
+            // already passed: with the patient wall-repair/scatter settings a strike is up to
+            // `iter_no_imprv_limit` (400) iterations, so a 0.3 s pack-down budget measured ~2.5 s
+            // and a 2 s total budget ran ~3.8 s. The partial work is kept — `min_loss_sol` always
+            // holds the best solution seen — so an interrupted separation still returns its best
+            // attempt, exactly as an exhausted one does.
+            while n_iter_no_improvement < self.config.iter_no_imprv_limit && !term.kill() {
                 let (loss_before, w_loss_before) = (self.ct.get_total_loss(), self.ct.get_total_weighted_loss(),);
                 sep_stats += self.move_items_multi();
                 let (loss, w_loss) = (self.ct.get_total_loss(), self.ct.get_total_weighted_loss(),);

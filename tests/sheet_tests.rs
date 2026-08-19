@@ -670,7 +670,7 @@ mod sheet_integration_tests {
             .collect();
 
         // THE call that used to panic with "invalid SlotMap key used".
-        let (after, n_moved) = compact_sheets_left(&mut sep, &sc, &before);
+        let (after, n_moved) = compact_sheets_left(&mut sep, &sc, &before, &BasicTerminator::new());
 
         // Feasible, wall-clear, and nothing lost.
         let layout = jagua_rs::entities::Layout::from_snapshot(&after.layout_snapshot);
@@ -779,25 +779,26 @@ mod sheet_integration_tests {
         Ok(())
     }
 
-    /// MEDIUM — `--sheet-gap 0` must be honoured rather than silently replaced by the 20 mm default.
+    /// CRITICAL (audit) — `--sheet-gap 0` must be **rejected**, not honoured.
+    ///
+    /// This test used to assert the opposite ("a zero gap yields degenerate wall intervals, which
+    /// `apply_sheet_walls` filters out"), which is precisely the bug: filtering the walls out turns
+    /// a walled run into a plain strip run that still reports sheets. The audited reproduction
+    /// (`--sheet-width 1995 --sheet-gap 0`) exported a layout with 10 items straddling a boundary
+    /// at exit 0. A zero-thickness wall is not representable as a `Rect` hazard, and since the gap
+    /// is virtual — the sheets are separate physical objects — refusing it costs nothing.
     #[test]
-    fn zero_sheet_gap_is_honoured() {
+    fn zero_sheet_gap_is_rejected() {
         use sparrow::config::SheetConfig;
 
-        assert_eq!(SheetConfig::resolve_gap(Some(0.0), None), 0.0,
-            "--sheet-gap 0 must stay 0, not fall back to the default");
-        assert_eq!(SheetConfig::resolve_gap(Some(7.5), None), 7.5, "an explicit gap is used as given");
-        assert!(SheetConfig::resolve_gap(None, None) > 0.0, "no --sheet-gap still gets the default");
-        assert_eq!(SheetConfig::resolve_gap(None, Some(5.0)), 20.0_f32.max(10.0),
+        assert!(SheetConfig::resolve_gap(Some(0.0), None).is_err(),
+            "--sheet-gap 0 cannot be modelled and must be rejected");
+        assert!(SheetConfig::resolve_gap(Some(-5.0), None).is_err(),
+            "a negative gap must be an error, not a silent fallback to the 20 mm default");
+        assert_eq!(SheetConfig::resolve_gap(Some(7.5), None).unwrap(), 7.5, "an explicit legal gap is used as given");
+        assert!(SheetConfig::resolve_gap(None, None).unwrap() > 0.0, "no --sheet-gap still gets the default");
+        assert_eq!(SheetConfig::resolve_gap(None, Some(5.0)).unwrap(), 20.0_f32.max(10.0),
             "the default still respects 2 * min_item_separation");
-
-        // With gap 0 the pitch is the bare sheet width and the (degenerate) walls are dropped.
-        let sc = SheetConfig::new(1000.0, 0.0, false);
-        assert_eq!(sc.pitch(), 1000.0);
-        assert_eq!(n_sheets(2500.0, &sc), 3);
-        let walls = wall_intervals(2500.0, &sc);
-        assert!(walls.iter().all(|(lo, hi)| lo == hi),
-            "a zero gap yields degenerate wall intervals, which apply_sheet_walls filters out");
     }
 
 }

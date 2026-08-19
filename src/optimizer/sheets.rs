@@ -157,10 +157,17 @@ pub fn apply_sheet_walls(prob: &mut SPProblem, sheet: &SheetConfig) {
     let width = strip.width;
     let height = strip.fixed_height;
 
+    // A degenerate wall interval (`x_min == x_max`, i.e. `gap == 0`) is not representable as a
+    // `Rect` hazard. Silently filtering such walls out — as this used to do — turns a walled run
+    // into a plain strip run that still *reports* sheets, and items straddle the boundaries freely.
+    // `SheetConfig::resolve_gap` rejects a gap below `MIN_SHEET_GAP` at the CLI, so reaching here
+    // with one means a caller constructed the config by hand.
+    assert!(
+        sheet.gap >= crate::util::io::MIN_SHEET_GAP,
+        "a sheet gap of {} mm cannot be modelled as a wall hazard (minimum is {} mm)",
+        sheet.gap, crate::util::io::MIN_SHEET_GAP,
+    );
     let walls = wall_intervals(width, sheet).into_iter()
-        // With `--sheet-gap 0` the wall interval is degenerate (`x_min == x_max`) and `Rect::try_new`
-        // rejects it. There is nothing to model in that case — the sheets touch, so no strip of
-        // material is forbidden — and the boundary is enforced by the strip width alone.
         .filter(|(x_min, x_max)| x_max > x_min)
         .map(|(x_min, x_max)| OriginalShape {
             shape: SPolygon::from(
@@ -628,6 +635,15 @@ fn scatter_and_shrink(
     // Round-robin over the destination sheets keeps the scatter balanced without needing a
     // density computation that would immediately be invalidated by the previous placement.
     for (i, (pk, item_id)) in doomed.iter().enumerate() {
+        // The scatter itself is a loop over (potentially) a whole sheet's worth of items, each with
+        // a placement search of its own. Without a deadline check here the move ran to completion
+        // regardless of the budget it was given, which is half of why a 0.3 s pack-down step took
+        // 2.5 s. The items already relocated stay relocated; the `separate()` below (which also
+        // sees the expired terminator) then returns immediately and the caller rolls back.
+        if term.kill() {
+            warn!("[SHEET] {label}: out of time after scattering {i}/{} item(s), aborting the move", doomed.len());
+            break;
+        }
         let dst_k = i % n_target;
         let item = sep.instance.item(*item_id);
         let mut bbox = sheet_bbox(dst_k, sheet, height);
@@ -950,6 +966,7 @@ pub fn compact_sheets_left(
     sep: &mut Separator,
     sheet: &SheetConfig,
     init_sol: &SPSolution,
+    term: &impl Terminator,
 ) -> (SPSolution, usize) {
     rollback_to_width(sep, init_sol);
     let width = sep.prob.strip_width();
@@ -968,6 +985,16 @@ pub fn compact_sheets_left(
     order.sort_by_key(|(pk, x)| (*x, *pk));
 
     for (pk, _) in order {
+        // This post-pass used to run with no deadline at all: it is the *last* thing the
+        // compression phase does, and on a large instance its per-item binary search (each probe a
+        // full `move_item` + CDE query) added seconds *after* the phase's budget had already
+        // expired. Stopping between items is safe and needs no rollback — every accepted shift was
+        // individually verified collision-free and stays inside its own sheet, so the partially
+        // compacted layout is as valid as the fully compacted one, just less tidy.
+        if term.kill() {
+            warn!("[SHEET] per-sheet left-compaction: out of time, stopping after {n_moved} item(s)");
+            break;
+        }
         if !sep.prob.layout.placed_items.contains_key(pk) {
             continue;
         }

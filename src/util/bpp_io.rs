@@ -68,7 +68,8 @@ pub struct BppCli {
     pub rng_seed: Option<u64>,
 
     /// Minimum separation between items and between items and the bin edge (mm)
-    #[arg(long = "min-sep", value_name = "MM", help = "Minimum distance between items and between items and the bin edge (mm). \
+    #[arg(long = "min-sep", value_name = "MM", value_parser = crate::util::io::parse_non_negative_f32,
+        help = "Minimum distance between items and between items and the bin edge (mm). \
                 Items are inflated and bins are deflated by half this value each. Overrides the SPARROW_MIN_SEP env var")]
     pub min_item_separation: Option<f32>,
 

@@ -31,6 +31,15 @@ impl<T: Terminator> Terminator for PairTerminator<'_, T> {
     }
 }
 
+/// Wall-clock budget granted to the `--compact-sheets` post-pass.
+///
+/// The pass runs *after* the compression phase's own budget is exhausted (its shrink loop only
+/// exits when the terminator fires), so it cannot share that budget. It is a secondary tidy-up —
+/// it cannot change the strip width or the sheet count — so a small, hard cap is the right answer:
+/// it bounds how far the phase as a whole can overrun, and a partially compacted layout is exactly
+/// as valid as a fully compacted one.
+const COMPACT_SHEETS_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Algorithm 13 from https://doi.org/10.48550/arXiv.2509.13329
 pub fn compression_phase(
     instance: &SPInstance,
@@ -110,7 +119,14 @@ pub fn compression_phase(
     if let Some(sheet) = config.sheet.as_ref()
         && sheet.compact_sheets
     {
-        let (compacted, n_moved) = compact_sheets_left(sep, sheet, &best_sol);
+        // The phase's own terminator has normally *already* expired by the time this runs (the
+        // shrink loop above only exits when it does), so handing it in directly would make the
+        // post-pass a no-op. It gets a small bounded budget of its own instead, capped so that the
+        // whole phase cannot overrun by more than that: the pass is a secondary tidy-up and a
+        // partially compacted result is perfectly valid.
+        let mut cs_term = BasicTerminator::new();
+        cs_term.new_timeout(COMPACT_SHEETS_BUDGET);
+        let (compacted, n_moved) = compact_sheets_left(sep, sheet, &best_sol, &cs_term);
         if n_moved > 0 {
             debug_assert!(compacted.strip_width() == best_sol.strip_width(),
                 "the left-compaction must not change the strip width");

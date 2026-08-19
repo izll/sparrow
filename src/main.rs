@@ -13,8 +13,9 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use rand::rngs::Xoshiro256PlusPlus;
+use sparrow::util::verify;
 use sparrow::consts::{DEFAULT_COMPRESS_TIME_RATIO, DEFAULT_EXPLORE_TIME_RATIO, DEFAULT_FAIL_DECAY_RATIO_CMPR, DEFAULT_MAX_CONSEQ_FAILS_EXPL, LOG_LEVEL_FILTER_DEBUG, LOG_LEVEL_FILTER_RELEASE};
 use sparrow::util::ctrlc_terminator::CtrlCTerminator;
 use sparrow::util::listener::{ReportType, SolutionListener};
@@ -23,6 +24,14 @@ use sparrow::util::svg_exporter::SvgExporter;
 pub const OUTPUT_DIR: &str = "output";
 
 pub const LIVE_DIR: &str = "data/live";
+
+/// Largest total demand (sum over all item types) the binaries accept.
+///
+/// Both LBF constructors materialise **one `Vec` element per demanded copy**
+/// (`iter::repeat_n(id, missing_qty)`), so the demand is an allocation size, not just a number. A
+/// 100-million fixture reserved ~800 MB before placing a single item and aborted. The cap is far
+/// above any real nesting job and turns that abort into a message.
+pub const MAX_TOTAL_DEMAND: u64 = 1_000_000;
 
 fn main() -> Result<()>{
     let mut config = DEFAULT_SPARROW_CONFIG;
@@ -59,21 +68,24 @@ fn main() -> Result<()>{
     if let Some(arg_rng_seed) = args.rng_seed {
         config.rng_seed = Some(arg_rng_seed as usize);
     }
-    config.min_item_separation = io::resolve_min_item_separation(args.min_item_separation, config.min_item_separation);
+    config.min_item_separation = io::resolve_min_item_separation(args.min_item_separation, config.min_item_separation)?;
     if let Some(sep) = config.min_item_separation {
         info!("[MAIN] minimum item separation: {sep} (items inflated and container deflated by {} each)", sep / 2.0);
     }
 
     // Multi-sheet ("walled") strip mode, if requested
-    let sheet = args.sheet_width.map(|width| {
-        let gap = SheetConfig::resolve_gap(args.sheet_gap, config.min_item_separation);
-        let mut sc = SheetConfig::new(width, gap, args.compact_sheets);
-        sc.pack_down = args.pack_down_sheets;
-        if args.plain_first {
-            sc.pipeline = SheetPipeline::PlainFirst;
+    let sheet = match args.sheet_width {
+        Some(width) => {
+            let gap = SheetConfig::resolve_gap(args.sheet_gap, config.min_item_separation)?;
+            let mut sc = SheetConfig::new(width, gap, args.compact_sheets);
+            sc.pack_down = args.pack_down_sheets;
+            if args.plain_first {
+                sc.pipeline = SheetPipeline::PlainFirst;
+            }
+            Some(sc)
         }
-        sc
-    });
+        None => None,
+    };
     config.apply_sheet(sheet);
     if let Some(sheet) = sheet {
         info!("[MAIN] multi-sheet (walled) mode: sheet width {} mm, wall/gap {} mm; \
@@ -107,8 +119,38 @@ fn main() -> Result<()>{
 
     let (ext_instance, ext_solution) = io::read_spp_input(Path::new(&input_file_path))?;
 
+    // A demand of many millions expands into one `Vec` entry per copy in both LBF constructors
+    // (`iter::repeat_n(id, missing_qty).collect_vec()`), which is where a 100-million fixture went
+    // to die: an 800 MB allocation and an abort with no message. Refuse it with one instead.
+    let total_demand: u64 = ext_instance.items.iter().map(|it| it.demand).sum();
+    if total_demand > MAX_TOTAL_DEMAND {
+        bail!("the instance demands {total_demand} items, more than the supported maximum of \
+               {MAX_TOTAL_DEMAND}; every copy is materialised individually, so this would exhaust \
+               memory before the first placement");
+    }
+
+    // A malformed warm start reaches jagua's `import_solution`, which trusts it completely: an
+    // unknown item id indexes out of bounds, an over-placed one underflows the demand counter and a
+    // negative strip width builds an invalid `Rect` — all `panic = abort`, exit 134. Validate first.
+    if let Some(ext_sol) = ext_solution.as_ref() {
+        io::validate_spp_warm_start(&ext_instance, ext_sol)
+            .context("the warm start solution given with -i is not usable")?;
+    }
+
     let importer = Importer::new(config.cde_config, config.poly_simpl_tolerance, config.min_item_separation, config.narrow_concavity_cutoff_ratio);
-    let instance = jagua_rs::probs::spp::io::import_instance(&importer, &ext_instance)?;
+    let mut instance = jagua_rs::probs::spp::io::import_instance(&importer, &ext_instance)?;
+
+    // Packability gate. Two input-level impossibilities used to surface as aborts deep inside the
+    // engine: an item taller than the strip (LBF widens for ever -> "strip-width is running away")
+    // and a `--min-sep` so large relative to the instance that jagua's 100 %-density starting width
+    // deflates into an empty polygon. See `util::packability`.
+    if let Some(min_width) = sparrow::util::packability::check_spp_packability(&instance, config.min_item_separation)? {
+        info!("[MAIN] widening the initial strip {:.1} -> {:.1} mm so the container survives the \
+               {:.1} mm deflation --min-sep applies to it",
+            instance.base_strip.width, min_width, config.min_item_separation.unwrap_or(0.0) / 2.0);
+        instance.base_strip.set_width(min_width);
+    }
+    let instance = instance;
 
     let initial_solution = ext_solution.map(|e|
         jagua_rs::probs::spp::io::import_solution(&instance, &e)
@@ -132,7 +174,7 @@ fn main() -> Result<()>{
                 sheet.width, list);
         }
     }
-    
+
     let final_svg_path = format!("{OUTPUT_DIR}/final_{}.svg", ext_instance.name);
     let intermediate_svg_dir = match cfg!(feature = "only_final_svg") {
         true => None,
@@ -186,21 +228,25 @@ fn main() -> Result<()>{
         // infeasible run win precisely because it is infeasible: overlapping parts pack into a
         // narrower strip than separated ones ever could, so the worst run is the most likely to be
         // chosen and exported.
+        // The gate is the full export gate, not just `is_feasible()`: an *empty* layout is
+        // perfectly collision-free, so a run that lost items (or started from a warm start that had
+        // already lost them) is both "feasible" and narrower than every correct run — i.e. the
+        // guaranteed winner of a width-only selection. Demand coverage and cuttability are
+        // therefore checked here too.
         let mut feasible = vec![];
         for (run_idx, sol) in solutions.into_iter() {
-            let ok = jagua_rs::entities::Layout::from_snapshot(&sol.layout_snapshot).is_feasible();
+            let verdict = verify::verify_spp_solution(&sol, &instance, sheet.as_ref(), "the solution");
             info!("[MAIN] run {} (seed {}): width: {:.3}, density: {:.3}%{}",
                 run_idx, seed + run_idx as u64, sol.strip_width(), sol.density(&instance) * 100.0,
-                if ok { "" } else { "  <-- INFEASIBLE, excluded" });
-            if ok {
-                feasible.push((run_idx, sol));
-            } else {
-                warn!("[MAIN] run {} (seed {}) produced an infeasible layout and is excluded from the selection",
-                    run_idx, seed + run_idx as u64);
+                match &verdict { Ok(()) => String::new(), Err(e) => format!("  <-- REJECTED: {e}") });
+            match verdict {
+                Ok(()) => feasible.push((run_idx, sol)),
+                Err(e) => warn!("[MAIN] run {} (seed {}) produced an unusable solution and is excluded from the selection: {e}",
+                    run_idx, seed + run_idx as u64),
             }
         }
         if feasible.is_empty() {
-            bail!("all {} parallel runs produced infeasible layouts; nothing to export", n_runs);
+            bail!("all {} parallel runs produced unusable solutions; nothing to export", n_runs);
         }
         let (best_idx, best_sol) = feasible.into_iter()
             .min_by(|(_, a), (_, b)| a.strip_width().partial_cmp(&b.strip_width()).unwrap())
@@ -216,6 +262,15 @@ fn main() -> Result<()>{
     if let Some(sheet) = sheet.as_ref() {
         sparrow::optimizer::sheets::log_sheet_report("FINAL", &solution, &instance, sheet);
     }
+
+    // **The export gate.** Nothing downstream can tell a good JSON from a bad one, so the last
+    // thing that happens before the file is written is a full re-verification of the answer:
+    // exact demand per item id, collision-freedom, and — in the walled mode — that no item
+    // straddles a sheet wall. All three had reproducible ways of reaching the file: a warm start
+    // with a missing placement, `optimize`'s "possibly infeasible" fallback, and `--sheet-gap 0`
+    // respectively. On failure nothing is written and the process exits 1.
+    verify::verify_spp_solution(&solution, &instance, sheet.as_ref(), "the final solution")
+        .context("refusing to export")?;
 
     let json_path = format!("{OUTPUT_DIR}/final_{}.json", ext_instance.name);
     let json_output = ExtSPOutput {
