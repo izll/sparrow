@@ -550,26 +550,57 @@ mod audit_regression_tests {
     // =======================================================================================
     //
     // The criticals were all "exit 0 and export something wrong", which only the whole program
-    // exhibits. These are `#[ignore]`d so `cargo test` never depends on a release build existing;
-    // run them with `cargo build --release && cargo test --release -- --ignored`.
+    // exhibits. They run **by default**: every one uses `-e 0 -c 0`, so the whole group finishes in
+    // well under a second, and a gate that is `#[ignore]`d is a gate that a plain `cargo test`
+    // silently skips — which is exactly what the second audit found.
+    //
+    // The binary comes from `env!("CARGO_BIN_EXE_sparrow")`, which Cargo defines for every
+    // integration test as the path of the `sparrow` binary **built for this test run**, in this
+    // profile and this target directory. The previous version hardcoded
+    // `CARGO_MANIFEST_DIR/target/release/sparrow` and returned early when it was absent, so under a
+    // custom `CARGO_TARGET_DIR` it tested a stale binary from an earlier build, and with no binary
+    // present at all every test passed having asserted nothing.
 
     mod end_to_end {
         use super::*;
-        use std::path::PathBuf;
+        use std::path::{Path, PathBuf};
         use std::process::Command;
 
-        /// Path of the release binary, or `None` when it has not been built.
-        fn release_binary() -> Option<PathBuf> {
-            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/sparrow");
-            p.exists().then_some(p)
+        /// The `sparrow` binary built for **this** test run. A compile-time constant: it cannot be
+        /// missing, and it cannot be a different build than the one under test.
+        fn sparrow_binary() -> PathBuf {
+            PathBuf::from(env!("CARGO_BIN_EXE_sparrow"))
         }
 
-        /// Runs the release binary in a fresh temp dir and returns `(exit code, wrote a JSON?)`.
-        fn run(args: &[&str], input: &ExtSPInstance, solution: Option<&ExtSPSolution>) -> Option<(i32, bool)> {
-            let bin = release_binary()?;
+        /// Every file in `dir`, sorted.
+        fn files_in(dir: &Path) -> Vec<String> {
+            let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+            let mut names: Vec<String> = entries.flatten()
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// What a run left behind.
+        pub struct Outcome {
+            pub code: i32,
+            pub wrote_json: bool,
+            /// Any `final_*.svg` in `output/`. A rejected run must leave none: the optimizer's
+            /// listener used to write the final SVG *before* the export gate, so a run that
+            /// correctly refused to export its JSON still left an SVG of the rejected layout.
+            pub wrote_final_svg: bool,
+            pub files: Vec<String>,
+            pub stderr: String,
+        }
+
+        /// Runs the binary in a fresh temp dir and reports what it did.
+        fn run(args: &[&str], input: &ExtSPInstance, solution: Option<&ExtSPSolution>) -> Outcome {
+            let bin = sparrow_binary();
             let dir = std::env::temp_dir().join(format!("sparrow-audit-e2e-{}", std::process::id()))
                 .join(format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-            std::fs::create_dir_all(&dir).ok()?;
+            std::fs::create_dir_all(&dir).expect("could not create the test working directory");
 
             #[derive(serde::Serialize)]
             struct Out<'a> {
@@ -579,65 +610,80 @@ mod audit_regression_tests {
                 solution: Option<&'a ExtSPSolution>,
             }
             let input_path = dir.join("input.json");
-            std::fs::write(&input_path, serde_json::to_string(&Out { instance: input, solution }).ok()?).ok()?;
+            std::fs::write(&input_path, serde_json::to_string(&Out { instance: input, solution })
+                .expect("the fixture must serialise")).expect("could not write the test input");
 
-            let status = Command::new(&bin)
+            let output = Command::new(&bin)
                 .current_dir(&dir)
                 .arg("-i").arg(&input_path)
                 .args(args)
                 .output()
-                .ok()?;
-            let wrote_json = dir.join("output").join(format!("final_{}.json", input.name)).exists();
+                .unwrap_or_else(|e| panic!("could not run {}: {e}", bin.display()));
+
+            let files = files_in(&dir.join("output"));
+            let outcome = Outcome {
+                code: output.status.code().unwrap_or(-1),
+                wrote_json: files.iter().any(|f| f == &format!("final_{}.json", input.name)),
+                wrote_final_svg: files.iter().any(|f| f.starts_with("final_") && f.ends_with(".svg")),
+                files,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            };
             let _ = std::fs::remove_dir_all(&dir);
-            Some((status.status.code().unwrap_or(-1), wrote_json))
+            outcome
         }
 
         /// CRITICAL 1: `--sheet-gap 0` must be a clap error (exit 2) and write nothing.
         #[test]
-        #[ignore = "needs a release build; run with `cargo test --release -- --ignored`"]
         fn e2e_sheet_gap_zero_exits_2() {
             let ext = ext_instance(6, 60.0, 45.0, 100.0);
-            let Some((code, wrote)) = run(&["--sheet-width", "100", "--sheet-gap", "0", "-e", "1", "-c", "1", "-s", "42"], &ext, None) else { return };
-            assert_eq!(code, 2, "a rejected CLI value must exit 2");
-            assert!(!wrote, "nothing may be exported");
+            let out = run(&["--sheet-width", "100", "--sheet-gap", "0", "-e", "0", "-c", "0", "-s", "42"], &ext, None);
+            assert_eq!(out.code, 2, "a rejected CLI value must exit 2: {}", out.stderr);
+            assert!(!out.wrote_json, "nothing may be exported: {:?}", out.files);
+            assert!(!out.wrote_final_svg, "not even an SVG: {:?}", out.files);
         }
 
         /// CRITICAL 2: an incomplete warm start must exit 1 and write nothing (was: exit 0 + JSON).
         #[test]
-        #[ignore = "needs a release build; run with `cargo test --release -- --ignored`"]
         fn e2e_incomplete_warm_start_exits_1() {
             let ext = ext_instance(2, 40.0, 40.0, 100.0);
-            let sol = ext_solution(100.0, vec![placement(0, 0.0, 0.0)]);
-            let Some((code, wrote)) = run(&["-e", "0", "-c", "0", "-s", "42"], &ext, Some(&sol)) else { return };
-            assert_eq!(code, 1, "an unusable warm start must exit 1");
-            assert!(!wrote, "nothing may be exported");
+            let sol = ext_solution(100.0, vec![placement(0, 1.0, 1.0)]);
+            let out = run(&["-e", "0", "-c", "0", "-s", "42"], &ext, Some(&sol));
+            assert_eq!(out.code, 1, "an unusable warm start must exit 1: {}", out.stderr);
+            assert!(!out.wrote_json, "nothing may be exported: {:?}", out.files);
+            assert!(!out.wrote_final_svg, "not even an SVG: {:?}", out.files);
         }
 
         /// CRITICAL 3: an overlapping warm start must exit 1 and write nothing (was: exit 0 + JSON
         /// with 1 185 179.5 mm² of overlap).
         #[test]
-        #[ignore = "needs a release build; run with `cargo test --release -- --ignored`"]
         fn e2e_overlapping_warm_start_exits_1() {
             let ext = ext_instance(2, 40.0, 40.0, 100.0);
             let sol = ext_solution(45.0, vec![placement(0, 0.0, 0.0), placement(0, 1.0, 1.0)]);
-            let Some((code, wrote)) = run(&["-e", "0", "-c", "0", "-s", "42"], &ext, Some(&sol)) else { return };
-            assert_eq!(code, 1, "an infeasible solution must never be exported");
-            assert!(!wrote);
+            let out = run(&["-e", "0", "-c", "0", "-s", "42"], &ext, Some(&sol));
+            // In release the export gate turns this into exit 1. A debug build dies earlier, on the
+            // `[EXPL] exploration must start from a feasible layout` debug assertion (exit 101);
+            // the property both share — and the one that matters — is that nothing is exported.
+            assert_ne!(out.code, 0, "an infeasible solution must never be exported: {}", out.stderr);
+            if !cfg!(debug_assertions) {
+                assert_eq!(out.code, 1, "in release the gate must make it exit 1: {}", out.stderr);
+            }
+            assert!(!out.wrote_json, "{:?}", out.files);
+            assert!(!out.wrote_final_svg, "not even an SVG: {:?}", out.files);
         }
 
         /// HIGH 5: an unknown item id must exit 1, not abort with 134.
         #[test]
-        #[ignore = "needs a release build; run with `cargo test --release -- --ignored`"]
         fn e2e_unknown_item_id_exits_1_not_134() {
             let ext = ext_instance(2, 40.0, 40.0, 100.0);
-            let sol = ext_solution(100.0, vec![placement(999, 0.0, 0.0), placement(0, 0.0, 50.0)]);
-            let Some((code, _)) = run(&["-e", "0", "-c", "0", "-s", "42"], &ext, Some(&sol)) else { return };
-            assert_eq!(code, 1, "a malformed warm start must be an error, not an abort (was 134)");
+            let sol = ext_solution(100.0, vec![placement(999, 1.0, 1.0), placement(0, 1.0, 50.0)]);
+            let out = run(&["-e", "0", "-c", "0", "-s", "42"], &ext, Some(&sol));
+            assert_eq!(out.code, 1, "a malformed warm start must be an error, not an abort (was 134): {}", out.stderr);
+            assert!(!out.wrote_json, "{:?}", out.files);
+            assert!(!out.wrote_final_svg, "{:?}", out.files);
         }
 
         /// HIGH 6: non-finite CLI floats must exit 2, not abort or produce NaN output.
         #[test]
-        #[ignore = "needs a release build; run with `cargo test --release -- --ignored`"]
         fn e2e_non_finite_cli_floats_exit_2() {
             let ext = ext_instance(2, 40.0, 40.0, 100.0);
             for args in [
@@ -645,73 +691,89 @@ mod audit_regression_tests {
                 vec!["--sheet-width", "inf", "-e", "0", "-c", "0", "-s", "42"],
                 vec!["--min-sep", "NaN", "-e", "0", "-c", "0", "-s", "42"],
             ] {
-                let Some((code, wrote)) = run(&args, &ext, None) else { return };
-                assert_eq!(code, 2, "{args:?} must be a clap error");
-                assert!(!wrote, "{args:?} must not export anything");
+                let out = run(&args, &ext, None);
+                assert_eq!(out.code, 2, "{args:?} must be a clap error: {}", out.stderr);
+                assert!(!out.wrote_json, "{args:?} must not export anything: {:?}", out.files);
+                assert!(!out.wrote_final_svg, "{args:?} must not leave an SVG: {:?}", out.files);
             }
         }
 
         /// HIGH 7: an item taller than the strip must exit 1, not abort with 134.
         #[test]
-        #[ignore = "needs a release build; run with `cargo test --release -- --ignored`"]
         fn e2e_item_taller_than_strip_exits_1_not_134() {
+            // A *fixed-orientation* part (`allowed_orientations: [0.0]`, as `ext_item` builds), so
+            // no rotation can rescue it — with continuous rotation the pre-check deliberately keeps
+            // quiet, because its 16-step grid samples a continuum and cannot prove non-fitting.
             let ext = ExtSPInstance { name: "tall".into(), items: vec![ext_item(0, 1, 20.0, 80.0)], strip_height: 50.0 };
-            let Some((code, _)) = run(&["-e", "0", "-c", "0", "-s", "42"], &ext, None) else { return };
-            assert_eq!(code, 1, "an unpackable instance must be an error, not an abort (was 134)");
+            let out = run(&["-e", "0", "-c", "0", "-s", "42"], &ext, None);
+            assert_eq!(out.code, 1, "an unpackable instance must be an error, not an abort (was 134): {}", out.stderr);
+            assert!(!out.wrote_json, "{:?}", out.files);
+            assert!(!out.wrote_final_svg, "{:?}", out.files);
         }
 
         /// HIGH 7 (second half): a large `--min-sep` must now *succeed* rather than abort — the
         /// instance is solvable, only jagua's starting width was too small to survive the deflation.
         #[test]
-        #[ignore = "needs a release build; run with `cargo test --release -- --ignored`"]
         fn e2e_large_min_sep_succeeds() {
             let ext = ext_instance(2, 10.0, 10.0, 100.0);
-            let Some((code, wrote)) = run(&["--min-sep", "20", "-e", "0", "-c", "0", "-s", "42"], &ext, None) else { return };
-            assert_eq!(code, 0, "this instance is solvable at a sane width (was: abort 134)");
-            assert!(wrote, "and it must produce a solution");
+            let out = run(&["--min-sep", "20", "-e", "0", "-c", "0", "-s", "42"], &ext, None);
+            assert_eq!(out.code, 0, "this instance is solvable at a sane width (was: abort 134): {}", out.stderr);
+            assert!(out.wrote_json, "and it must produce a solution: {:?}", out.files);
+            assert!(out.wrote_final_svg, "a successful run writes the final SVG too: {:?}", out.files);
         }
 
         /// MEDIUM 9: an absurd demand must be a message, not an 800 MB allocation and an abort.
         #[test]
-        #[ignore = "needs a release build; run with `cargo test --release -- --ignored`"]
         fn e2e_huge_demand_exits_1() {
             let ext = ext_instance(100_000_000, 10.0, 10.0, 100.0);
-            let Some((code, wrote)) = run(&["-e", "0", "-c", "0", "-s", "42"], &ext, None) else { return };
-            assert_eq!(code, 1, "an unsupportable demand must be a clean error");
-            assert!(!wrote);
+            let out = run(&["-e", "0", "-c", "0", "-s", "42"], &ext, None);
+            assert_eq!(out.code, 1, "an unsupportable demand must be a clean error: {}", out.stderr);
+            assert!(!out.wrote_json, "{:?}", out.files);
+            assert!(!out.wrote_final_svg, "{:?}", out.files);
         }
 
         /// CRITICAL 2, sheets half: the exact-demand gate must apply to the **walled** warm-start
         /// path too, which the audit found had no such check at all.
         #[test]
-        #[ignore = "needs a release build; run with `cargo test --release -- --ignored`"]
         fn e2e_sheets_warm_start_demand_is_gated() {
             let ext = ext_instance(4, 40.0, 40.0, 100.0);
             let sol = ext_solution(200.0, vec![placement(0, 1.0, 1.0), placement(0, 60.0, 1.0)]);
-            let Some((code, wrote)) = run(
-                &["--sheet-width", "100", "--sheet-gap", "20", "-e", "1", "-c", "1", "-s", "42"],
-                &ext, Some(&sol)) else { return };
-            assert_eq!(code, 1, "2 of 4 items in a walled warm start must be rejected");
-            assert!(!wrote, "nothing may be exported");
+            let out = run(
+                &["--sheet-width", "100", "--sheet-gap", "20", "-e", "0", "-c", "0", "-s", "42"],
+                &ext, Some(&sol));
+            assert_eq!(out.code, 1, "2 of 4 items in a walled warm start must be rejected: {}", out.stderr);
+            assert!(!out.wrote_json, "nothing may be exported: {:?}", out.files);
+            assert!(!out.wrote_final_svg, "not even an SVG: {:?}", out.files);
         }
 
         /// MEDIUM 10 end-to-end: the audit's own reproduction shape — `-e 1 -c 1` with the
         /// pack-down and compact-sheets operators enabled — must finish inside `budget + 1.5 s`.
         /// It measured ~3.8 s against a 2 s budget before the deadline checks were added.
+        ///
+        /// The only `#[ignore]`d test in this module, and for a reason the others do not share: it
+        /// asserts on **wall-clock time**, so it is meaningless in a debug build (where one
+        /// separator iteration is several times slower) and unreliable on a loaded machine. Run it
+        /// deliberately:
+        ///
+        /// ```bash
+        /// cargo test --release --test audit_regression_tests -- --ignored --nocapture
+        /// ```
+        ///
+        /// or via `scripts/ci.sh`, which runs the whole gate.
         #[test]
-        #[ignore = "needs a release build; run with `cargo test --release -- --ignored`"]
+        #[ignore = "wall-clock assertion: only meaningful in release. `cargo test --release --test audit_regression_tests -- --ignored`"]
         fn e2e_pack_down_honours_the_time_budget() {
             use std::time::{Duration, Instant};
 
             // Enough parts, and tight enough, that both operators have real work to do.
             let ext = ext_instance(24, 40.0, 40.0, 200.0);
             let start = Instant::now();
-            let Some((code, _)) = run(
+            let out = run(
                 &["--sheet-width", "150", "--sheet-gap", "20", "--min-sep", "5",
                   "--compact-sheets", "--pack-down-sheets", "-e", "1", "-c", "1", "-s", "42"],
-                &ext, None) else { return };
+                &ext, None);
             let elapsed = start.elapsed();
-            assert_eq!(code, 0, "this instance is packable and must succeed");
+            assert_eq!(out.code, 0, "this instance is packable and must succeed: {}", out.stderr);
 
             // 1 s explore + 1 s compress, plus the allowance the task asks for. Process start-up,
             // instance import and the final SVG/JSON write all sit outside the phase budgets.

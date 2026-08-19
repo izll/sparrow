@@ -156,7 +156,7 @@ mod bpp_shelf_integration_tests {
             &mut BasicTerminator::new(),
             &config,
             None,
-        );
+        )?;
 
         let densities = sol.layout_snapshots.values()
             .map(|ls| format!("{:.1}%", ls.density(&instance) * 100.0))

@@ -163,8 +163,14 @@ pub fn optimize(
         log_sheet_report("CMPR", &cmpr_sol, &instance, sheet);
     }
 
-    sol_listener.report(ReportType::Final, &cmpr_sol, &instance);
-
+    // **No `ReportType::Final` here.** The listener is what writes `output/final_<name>.svg`, and
+    // this point is *before* the caller's export gate (`util::verify`). Reporting the final
+    // solution from inside `optimize` therefore published the answer to disk before anything had
+    // checked it: an overlapping warm start exited 1 and wrote no JSON, exactly as intended, and
+    // still left a `final_<name>.svg` of the rejected layout sitting in `output/` — a file that
+    // looks like the run's result and is not. The caller emits `Final` after its gate passes; see
+    // `main.rs`.
+    //
     // Return the final compressed solution
     cmpr_sol
 }

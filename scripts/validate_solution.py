@@ -5,7 +5,8 @@ Checks, on the ORIGINAL contours (not the inflated collision shapes):
   * every pair of placed items keeps >= min_sep (default 0) distance (no overlap)
   * every item lies inside its container (bin rect, or the strip / sheet), with >= min_sep from the border
   * every item keeps >= min_sep from every hole (inner ring) of its container, and does not overlap one
-  * every item's rotation is one of its `allowed_orientations` (mod 360); null means continuous
+  * every item's rotation is one of its `allowed_orientations` (mod 360); null/absent means
+    continuous rotation, an EMPTY list means a fixed 0 degrees (jagua's RotationRange::None)
   * quality zones: an item with `min_quality` q may not touch (nor come within min_sep of) any zone
     whose quality is < q; a null `min_quality` demands top quality, i.e. every zone must be avoided
   * BPP: the number of layouts using a bin never exceeds that bin's `stock`
@@ -71,13 +72,28 @@ ANGLE_TOL = 1e-3    # degrees; the exported rotations are float32-rounded, so ex
 def orientation_ok(rotation, allowed):
     """True if `rotation` matches one of the `allowed` angles (degrees), modulo 360.
 
-    `allowed` being None/absent means CONTINUOUS rotation -- the item may be placed at any angle --
-    which is a different thing from an empty list (no orientation permitted at all), so the two are
-    NOT collapsed here. The comparison is modulo 360 because the engine exports the angle it happens
-    to hold: a part with allowed_orientations [0, 180] is routinely written out as -180.0.
+    The mapping is jagua-rs' (io/import.rs), not this script's invention:
+
+        absent / null   -> RotationRange::Continuous  -- any angle
+        []              -> RotationRange::None        -- FIXED at 0 degrees
+        [0.0]           -> RotationRange::None        -- FIXED at 0 degrees
+        [a, b, ...]     -> RotationRange::Discrete    -- one of those angles
+
+    The empty list used to be read here as "no orientation is permitted at all", which rejects every
+    possible placement of the item -- so a perfectly good solution came back as an error. It was not
+    hypothetical: the engines themselves write `allowed_orientations: []` for a fixed-orientation
+    item, so BOTH sparrow motors' legitimate output failed validation and nest_race.py exited 1 with
+    no usable candidate. An item that may be placed at no angle whatsoever could never be packed, so
+    "fixed at 0" is the only reading under which such an instance is solvable, and it is the one the
+    engine implements.
+
+    The comparison is modulo 360 because the engine exports the angle it happens to hold: a part
+    with allowed_orientations [0, 180] is routinely written out as -180.0.
     """
     if allowed is None:
         return True
+    if not allowed:                      # [] means a fixed 0-degree orientation, same as [0.0]
+        allowed = [0.0]
     return any(min((rotation - ang) % 360.0, (ang - rotation) % 360.0) <= ANGLE_TOL for ang in allowed)
 
 
@@ -437,8 +453,13 @@ def self_test():
     # 6. Orientation matching. -180 must satisfy an allowed set of [0, 180] (the engine exports the
     #    angle it holds, and -180 is the same physical placement as 180), 45 must not, and a null
     #    list means continuous rotation so anything goes.
+    #    An EMPTY list is jagua's `RotationRange::None`, i.e. a fixed 0 degrees -- exactly the same
+    #    as [0.0], and emphatically NOT "nothing is allowed". Reading it the other way rejected the
+    #    engines' own legitimate output; see orientation_ok().
     cases = [(-180.0, [0.0, 180.0], True), (45.0, [0.0], False), (360.0, [0.0], True),
-             (0.0009, [0.0], True), (0.5, [0.0], False), (45.0, None, True)]
+             (0.0009, [0.0], True), (0.5, [0.0], False), (45.0, None, True),
+             (0.0, [], True), (360.0, [], True), (-0.0005, [], True),
+             (45.0, [], False), (90.0, [], False)]
     bad = [(r, al, exp) for r, al, exp in cases if orientation_ok(r, al) != exp]
     print(f'[self-test] orientation matching (mod 360 / continuous): {len(cases) - len(bad)}/{len(cases)} as expected')
     if bad:

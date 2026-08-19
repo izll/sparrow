@@ -18,6 +18,7 @@ mod bpp_packdown_integration_tests {
     use sparrow::optimizer::bpp::explore::{exploration_phase, required_density_for_reduction};
     use sparrow::optimizer::bpp::lbf::BPLBFBuilder;
     use sparrow::optimizer::bpp::optimize_bpp;
+    use sparrow::optimizer::bpp::compress::pack_down;
     use sparrow::optimizer::bpp::separator::BPSeparator;
     use sparrow::util::bpp_io::DummyBPSolListener;
     use sparrow::util::io;
@@ -109,7 +110,7 @@ mod bpp_packdown_integration_tests {
             &mut term,
             &config,
             None,
-        );
+        )?;
 
         let cost = sol.cost(&instance);
         let densities = bin_densities(&sol, &instance);
@@ -280,20 +281,105 @@ mod bpp_packdown_integration_tests {
         sol.layout_snapshots.values().filter(|ls| ls.placed_items.len() > 1).count()
     }
 
-    /// **The phase-6 headline test.** On the iso6 instance the old pack-down took only the single
-    /// least dense bin as source — a lonely 997 x 605 piece that fits nowhere — tried one
-    /// destination and returned in 0.0 s with 10 s of budget untouched, while the 45 % bins and the
-    /// gap-riddled 67-79 % bins were never looked at.
+    /// **The phase-6 headline test**, rewritten as a *deterministic* property.
     ///
-    /// With every bin taking a turn as source, and every bin being consolidated, cross-bin moves
-    /// must now actually happen and the compression phase must actually use its budget.
+    /// The property pack-down exists to guarantee is: **every open bin takes a turn as source.** On
+    /// iso6 the old (phase-4) version took only the single least dense bin — a lonely 997 x 605
+    /// piece that fits nowhere — tried one destination and returned in 0.0 s with 10 s of budget
+    /// untouched, while the 45 % bins and the gap-riddled 67-79 % bins were never looked at.
+    ///
+    /// The previous version of this test asserted that instead by wall clock: "after
+    /// `optimize_bpp`, at least one per-bin density differs from the exploration result", i.e. *a
+    /// cross-bin move was accepted within the budget*. That is a different property, and a
+    /// non-deterministic one — whether a given transfer's separation converges inside its per-move
+    /// time limit depends on machine load. The second audit measured exactly that: FAILED with
+    /// "no cross-bin move happened" in a clean release suite, PASS on an immediate isolated rerun,
+    /// **with an identical density vector**. A release gate that flips on load is not a gate.
+    ///
+    /// So the assertion is now on [`PackDownStats::sources_visited`], which the loop records as it
+    /// goes: every layout that was enumerated as a source, in visit order. Whether any particular
+    /// transfer is accepted is left to the heuristic; that *every bin was tried* is not.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "pack-down needs release speed (tracker_matches_layout debug asserts starve the time budget); run with `cargo test --release`")]
     fn pack_down_uses_every_bin_as_source_on_iso6() -> Result<()> {
         let instance = build_iso6_instance()?;
         let config = iso6_config();
 
-        // Reference point: the state the compression phase starts from.
+        // Drive the exploration phase to the 9-bin state the compression phase starts from, then
+        // run `pack_down` on it directly. Going through `optimize_bpp` would work too, but this way
+        // the test observes the loop it is about rather than the whole pipeline around it.
+        let builder = BPLBFBuilder::new(
+            instance.clone(), Xoshiro256PlusPlus::seed_from_u64(42), LBF_SAMPLE_CONFIG,
+        ).construct()?;
+        let rng = builder.rng.clone();
+        let mut sep = BPSeparator::new(
+            instance.clone(), builder.prob, rng, config.expl_cfg.separator_config,
+        );
+        let mut term = BasicTerminator::new();
+        term.new_timeout(config.expl_cfg.time_limit);
+        let sols = exploration_phase(&instance, &mut sep, &mut DummyBPSolListener, &term, &config.expl_cfg);
+        let expl_sol = sols.last().expect("at least one solution").clone();
+        assert_eq!(expl_sol.cost(&instance), ISO6_OPTIMAL_COST,
+            "test setup: the exploration phase must reach the proven 9-bin optimum");
+
+        // The set of bins the pack-down is supposed to visit.
+        let n_bins_before = sep.prob.layouts.len();
+        assert_eq!(n_bins_before, ISO6_OPTIMAL_COST as usize,
+            "test setup: the separator must hold the 9-bin solution");
+        let bins_before: std::collections::BTreeSet<_> = sep.prob.layouts.keys().collect();
+
+        let mut cmpr_sep = BPSeparator::new(
+            sep.instance.clone(), sep.prob, Xoshiro256PlusPlus::seed_from_u64(43),
+            config.cmpr_cfg.separator_config,
+        );
+        let mut pd_term = BasicTerminator::new();
+        pd_term.new_timeout(config.cmpr_cfg.time_limit);
+        let (sol, stats) = pack_down(
+            &mut cmpr_sep, &pd_term, &config.cmpr_cfg, &mut DummyBPSolListener, &instance,
+        );
+
+        println!("[TEST] pack-down: {} pass(es), {} source visit(s) over {} distinct bin(s), {} move(s)",
+            stats.n_passes, stats.sources_visited.len(), stats.distinct_sources().len(), stats.n_moved);
+
+        // 1. **The property.** Every bin that existed when the pass started was taken as a source.
+        //    A bin may be *closed* by an accepted move (it empties out), which is a success, not a
+        //    miss — so the visited set has to cover every bin that survived, plus every bin that
+        //    was closed, which together is exactly `bins_before`.
+        let visited = stats.distinct_sources();
+        let missed: Vec<_> = bins_before.difference(&visited).collect();
+        assert!(missed.is_empty(),
+            "pack-down must take EVERY open bin as a source; {} of {n_bins_before} never had a turn: {missed:?}",
+            missed.len());
+
+        // 2. It really did make a full pass, not a single source and out (the phase-4 behaviour).
+        assert!(stats.n_passes >= 1, "at least one full pass must have run");
+        assert!(stats.sources_visited.len() >= n_bins_before,
+            "a full pass visits every source once, so at least {n_bins_before} visits were expected, \
+             got {}", stats.sources_visited.len());
+
+        // 3. The result is still a valid solution and did not cost bins.
+        assert_feasible(&sol, &instance);
+        assert!(sol.cost(&instance) <= ISO6_OPTIMAL_COST,
+            "pack-down may close a bin, never open one");
+        Ok(())
+    }
+
+    /// The **long-budget** variant of the above: the wall-clock-dependent half of the old test,
+    /// kept because "a cross-bin move actually happens on iso6" is worth knowing — just not worth
+    /// gating a release on. `#[ignore]`d, so it is opt-in:
+    ///
+    /// ```bash
+    /// cargo test --release --test bpp_packdown_tests -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "wall-clock dependent (the audit measured it flaky); run with `cargo test --release --test bpp_packdown_tests -- --ignored`"]
+    fn pack_down_moves_items_across_bins_on_iso6_with_a_long_budget() -> Result<()> {
+        let instance = build_iso6_instance()?;
+        let mut config = iso6_config();
+        // Three times the budget of the deterministic test, so the heuristic has room to land a
+        // move even on a loaded machine.
+        config.cmpr_cfg.time_limit = Duration::from_secs(45);
+
         let (expl_sol, expl_densities) = {
             let builder = BPLBFBuilder::new(
                 instance.clone(), Xoshiro256PlusPlus::seed_from_u64(42), LBF_SAMPLE_CONFIG,
@@ -324,7 +410,7 @@ mod bpp_packdown_integration_tests {
             &mut term,
             &config,
             None,
-        );
+        )?;
         let elapsed = start.elapsed();
 
         let cost = sol.cost(&instance);
@@ -334,26 +420,18 @@ mod bpp_packdown_integration_tests {
             densities.iter().map(|x| format!("{:.1}%", x * 100.0)).collect::<Vec<_>>(),
             elapsed.as_secs_f32());
 
-        // 1. Still feasible, full demand placed.
         assert_feasible(&sol, &instance);
-
-        // 2. The bin count is the proven optimum and must not regress.
         assert_eq!(cost, ISO6_OPTIMAL_COST, "iso6 must stay at its proven optimum of 9 bins");
 
-        // 3. **A cross-bin move happened.** No listener plumbing is needed to see one: a cross-bin
-        //    move is the *only* mechanism in the whole compression phase that changes any bin's
-        //    density (the intra-layout consolidation relocates items strictly within one bin, and
-        //    the total density is fixed once the bin count is). So if the sorted per-bin density
-        //    vector differs at all from the one the phase started with, items crossed a bin border.
+        // A cross-bin move is the *only* mechanism in the compression phase that changes any bin's
+        // density (intra-layout consolidation relocates items strictly within one bin, and the
+        // total density is fixed once the bin count is), so a changed density vector proves one.
         assert_eq!(densities.len(), expl_densities.len(), "the bin count must not have changed");
-        let moved = densities.iter().zip(expl_densities.iter())
-            .any(|(a, b)| (a - b).abs() > 1e-4);
+        let moved = densities.iter().zip(expl_densities.iter()).any(|(a, b)| (a - b).abs() > 1e-4);
         assert!(moved,
             "no cross-bin move happened: the per-bin densities are unchanged from the exploration \
              result ({expl_densities:?})");
 
-        // 4. ... and it went in the `Concentrate` direction: the *spread* of the densities grew,
-        //    i.e. dense bins got denser at the expense of sparser ones.
         let range = |d: &[f32]| d.last().copied().unwrap_or(0.0) - d.first().copied().unwrap_or(0.0);
         let spread_sum = |d: &[f32]| -> f32 {
             let mean = d.iter().sum::<f32>() / d.len() as f32;
@@ -366,14 +444,6 @@ mod bpp_packdown_integration_tests {
             "Concentrate must pull the per-bin densities apart: spread {:.4} -> {:.4}",
             spread_sum(&expl_densities), spread_sum(&densities));
 
-        // 5. The compression phase actually used its budget instead of returning in 0.0 s. The
-        //    exploration part of the run is bounded by its own 5 s limit, so anything beyond
-        //    ~6 s is compression time.
-        assert!(elapsed > Duration::from_secs(6),
-            "compression used less than 1 s (total run {elapsed:?}); the old bug was that pack-down \
-             returned instantly and the budget was thrown away");
-
-        // Sanity: the exploration reference really is the 9-bin solution the phase starts from.
         assert_eq!(expl_sol.cost(&instance), ISO6_OPTIMAL_COST);
         Ok(())
     }
@@ -401,7 +471,7 @@ mod bpp_packdown_integration_tests {
                 &mut term,
                 &config,
                 None,
-            );
+            ).expect("this instance is packable, so a start always exists");
             assert_feasible(&sol, &instance);
             (sol.cost(&instance), bin_densities(&sol, &instance))
         };

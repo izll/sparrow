@@ -89,7 +89,7 @@ mod bpp_explore_integration_tests {
             &mut term,
             &config,
             None,
-        );
+        )?;
 
         let cost = sol.cost(&instance);
         println!("[TEST] optimize_bpp: cost {cost} (LBF: {lbf_cost}), {} bins, total dens {:.2}%",

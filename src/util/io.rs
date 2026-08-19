@@ -276,6 +276,10 @@ pub fn validate_spp_warm_start(ext_instance: &ExtSPInstance, ext_solution: &ExtS
     let demand: BTreeMap<u64, u64> = ext_instance.items.iter()
         .map(|it| (it.base.id, it.demand))
         .collect();
+    // The declared orientations, per item id, for the rotation gate below.
+    let orientations: BTreeMap<u64, Option<Vec<f32>>> = ext_instance.items.iter()
+        .map(|it| (it.base.id, it.base.allowed_orientations.clone()))
+        .collect();
 
     let mut placed: BTreeMap<u64, u64> = BTreeMap::new();
     for (idx, pi) in ext_solution.layout.placed_items.iter().enumerate() {
@@ -288,6 +292,25 @@ pub fn validate_spp_warm_start(ext_instance: &ExtSPInstance, ext_solution: &ExtS
         if !t.rotation.is_finite() || !t.translation.0.is_finite() || !t.translation.1.is_finite() {
             anyhow::bail!("the warm start solution has a non-finite transformation for item {} (placement #{idx})", pi.item_id);
         }
+        // **Rotation gate.** A warm start is replayed as-is, so a disallowed angle is carried
+        // straight into the exported answer. It is invisible geometrically — the layout can be
+        // perfectly collision-free — but an item declares `allowed_orientations` precisely because
+        // the material has a grain/pattern direction, so an angle outside the list is scrap. The
+        // audit's repro was exactly this: `allowed_orientations: [0.0]` with a 45° placement,
+        // exported at exit 0.
+        let allowed = orientations.get(&pi.item_id).and_then(|o| o.as_deref());
+        if !crate::util::rotations::ext_orientation_ok(t.rotation, allowed, crate::util::verify::ROTATION_TOL_DEG) {
+            anyhow::bail!("the warm start solution places item {} (placement #{idx}) at {}°, which is \
+                           not one of its allowed_orientations ({}); a warm start is restored as-is, \
+                           so this rotation would be carried straight through to the exported solution",
+                pi.item_id, t.rotation,
+                match allowed {
+                    None => "any (continuous rotation)".to_string(),
+                    Some([]) => "0° only (an empty list means a fixed orientation)".to_string(),
+                    Some(list) => list.iter().map(|a| format!("{a}°")).collect::<Vec<_>>().join(", "),
+                });
+        }
+
         *placed.entry(pi.item_id).or_insert(0) += 1;
     }
 

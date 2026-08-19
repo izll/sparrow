@@ -6,6 +6,7 @@ use log::{info, warn, Level};
 use rand::SeedableRng;
 use sparrow::config::*;
 use sparrow::optimizer::optimize;
+use sparrow::util::demand::total_demand;
 use sparrow::util::io;
 use sparrow::util::io::{ExtSPOutput, MainCli};
 use sparrow::EPOCH;
@@ -24,14 +25,6 @@ use sparrow::util::svg_exporter::SvgExporter;
 pub const OUTPUT_DIR: &str = "output";
 
 pub const LIVE_DIR: &str = "data/live";
-
-/// Largest total demand (sum over all item types) the binaries accept.
-///
-/// Both LBF constructors materialise **one `Vec` element per demanded copy**
-/// (`iter::repeat_n(id, missing_qty)`), so the demand is an allocation size, not just a number. A
-/// 100-million fixture reserved ~800 MB before placing a single item and aborted. The cap is far
-/// above any real nesting job and turns that abort into a message.
-pub const MAX_TOTAL_DEMAND: u64 = 1_000_000;
 
 fn main() -> Result<()>{
     let mut config = DEFAULT_SPARROW_CONFIG;
@@ -122,12 +115,9 @@ fn main() -> Result<()>{
     // A demand of many millions expands into one `Vec` entry per copy in both LBF constructors
     // (`iter::repeat_n(id, missing_qty).collect_vec()`), which is where a 100-million fixture went
     // to die: an 800 MB allocation and an abort with no message. Refuse it with one instead.
-    let total_demand: u64 = ext_instance.items.iter().map(|it| it.demand).sum();
-    if total_demand > MAX_TOTAL_DEMAND {
-        bail!("the instance demands {total_demand} items, more than the supported maximum of \
-               {MAX_TOTAL_DEMAND}; every copy is materialised individually, so this would exhaust \
-               memory before the first placement");
-    }
+    let total_demand = total_demand(ext_instance.items.iter().map(|it| it.demand))
+        .context("the instance's demand is not supportable")?;
+    info!("[MAIN] total demand: {total_demand} item copies");
 
     // A malformed warm start reaches jagua's `import_solution`, which trusts it completely: an
     // unknown item id indexes out of bounds, an over-placed one underflows the demand counter and a
@@ -192,8 +182,11 @@ fn main() -> Result<()>{
     let run_optimization = |run_idx: usize, run_seed: u64| -> jagua_rs::probs::spp::entities::SPSolution {
         let rng = Xoshiro256PlusPlus::seed_from_u64(run_seed);
         // Every run gets its own SVG exporter; the final SVG is written by the main thread for the best run only.
+        // **No final path here.** The final SVG is written by the main thread *after* the export
+        // gate, for whichever solution the gate accepts — see the end of `main`. Handing the
+        // exporter a final path would put the answer on disk before it was verified.
         let mut svg_exporter = SvgExporter::new(
-            if n_runs == 1 { Some(final_svg_path.clone()) } else { None },
+            None,
             intermediate_svg_dir.as_ref().map(|d| if n_runs == 1 { d.clone() } else { format!("{d}/run_{run_idx}") }),
             if run_idx == 0 { live_svg_path.clone() } else { None },
         );
@@ -252,10 +245,6 @@ fn main() -> Result<()>{
             .min_by(|(_, a), (_, b)| a.strip_width().partial_cmp(&b.strip_width()).unwrap())
             .expect("the feasible list is non-empty");
         info!("[MAIN] best run: {} (seed {}), width: {:.3}, density: {:.3}%", best_idx, seed + best_idx as u64, best_sol.strip_width(), best_sol.density(&instance) * 100.0);
-
-        // Export the final SVG of the best run
-        SvgExporter::new(Some(final_svg_path.clone()), None, None)
-            .report(ReportType::Final, &best_sol, &instance);
         best_sol
     };
 
@@ -269,10 +258,22 @@ fn main() -> Result<()>{
     // straddles a sheet wall. All three had reproducible ways of reaching the file: a warm start
     // with a missing placement, `optimize`'s "possibly infeasible" fallback, and `--sheet-gap 0`
     // respectively. On failure nothing is written and the process exits 1.
+    // Any final artefact left over from an *earlier* run in this directory is not this run's
+    // answer. Remove it before the gate, so that a rejected run leaves no `final_*.svg`/`.json` at
+    // all — neither its own (it never writes one) nor a stale one that a reader would attribute to
+    // it. On success both are rewritten a few lines below.
+    let json_path = format!("{OUTPUT_DIR}/final_{}.json", ext_instance.name);
+    let _ = fs::remove_file(&final_svg_path);
+    let _ = fs::remove_file(&json_path);
+
     verify::verify_spp_solution(&solution, &instance, sheet.as_ref(), "the final solution")
         .context("refusing to export")?;
 
-    let json_path = format!("{OUTPUT_DIR}/final_{}.json", ext_instance.name);
+    // Past the gate: *now* the solution may be published. The SVG is written first and the JSON
+    // second, both to the same verified solution.
+    SvgExporter::new(Some(final_svg_path.clone()), None, None)
+        .report(ReportType::Final, &solution, &instance);
+
     let json_output = ExtSPOutput {
         instance: ext_instance,
         solution: jagua_rs::probs::spp::io::export(&instance, &solution, *EPOCH)

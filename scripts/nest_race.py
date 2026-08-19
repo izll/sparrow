@@ -61,6 +61,9 @@ ap.add_argument('--engines', default='sheets,bpp', help='comma list of sheets,bp
 ap.add_argument('--sparrow', default=os.path.join(HERE, '..', 'target', 'release', 'sparrow'))
 ap.add_argument('--sparrow-bpp', default=os.path.join(HERE, '..', 'target', 'release', 'sparrow-bpp'))
 ap.add_argument('--packingsolver', default=None, help='path to packingsolver_irregular (enables engine ps)')
+ap.add_argument('--ps-threads', type=int, default=None,
+                help='CPU threads PackingSolver may use. Default: probed from its --help; if it exposes no such '
+                     'flag, the race assumes it will take every CPU and falls back to --sequential (see ps_thread_limit())')
 ap.add_argument('--tol', type=float, default=0.05)
 ap.add_argument('--sequential', action='store_true', help='run engines one after another (each gets the whole CPU; total time = engines x t) instead of concurrently')
 ap.add_argument('--self-test', action='store_true', help='run the built-in checks (fake engines, no binaries needed) and exit')
@@ -79,6 +82,9 @@ inst = {}
 items = {}
 name = 'instance'
 te = tc = 1
+# Thread-limit argv fragment for PackingSolver, resolved in main() from its --help. Empty until then (and
+# for the self-test, which never launches a real PS).
+PS_THREAD_ARGV = []
 # Every engine's output must be newer than this. Set once, just before the engines are launched.
 RACE_T0 = 0.0
 # Slack on the freshness comparison. time.time() and the filesystem's mtime are not the same clock and do
@@ -271,7 +277,11 @@ def engine_ps():
                'bin_types': [{'type': 'rectangle', 'width': W, 'height': H, 'copies': 1000, 'item_bin_minimum_spacing': a.min_sep}],
                'item_types': ps_items}, open(inp, 'w'))
     cert = os.path.join(d, 'solution.json')
-    rc, dt = run([os.path.abspath(a.packingsolver), '--verbosity-level', '1', '--input', inp, '--time-limit', str(a.time), '--certificate', cert], d)
+    # PS_THREAD_ARGV is resolved once in main() (or by the self-test) from the binary's own --help; see
+    # ps_thread_limit(). Passing it here is what makes PS's CPU use part of the race's budget instead of
+    # an unmeasured handicap on the sparrow engines running beside it.
+    rc, dt = run([os.path.abspath(a.packingsolver), '--verbosity-level', '1', '--input', inp,
+                  '--time-limit', str(a.time), '--certificate', cert] + PS_THREAD_ARGV, d)
     if rc != 0: return {'engine': 'ps', 'ok': False, 'error': f'exit {rc}', 'time': dt}
     fresh, why = fresh_output(cert)
     if not fresh: return {'engine': 'ps', 'ok': False, 'error': why, 'time': dt}
@@ -333,7 +343,47 @@ def safe_engine(e):
                 'traceback': traceback.format_exc(limit=3)}
 
 # ---------------------------------------------------------------- CPU budget
-def cpu_budget(n_engines_concurrent, parallel_runs, cpus=None, workers=None):
+# Flags a packingsolver build might expose for limting its CPU use. Probed against its --help, in order;
+# the first one that appears is used. PackingSolver's own CLI has changed names across versions, so the
+# race asks the binary rather than assuming.
+PS_THREAD_FLAGS = ('--number-of-threads', '--threads', '-t')
+
+def ps_thread_limit(binary, requested=None, help_text=None):
+    """(argv_fragment, reserved_cpus, warning) — how many CPUs PackingSolver will take, and how to ask.
+
+    The race's CPU budget used to count only the sparrow engines:
+
+        len([e for e in engines if e in ('sheets', 'bpp')])
+
+    while PackingSolver ran alongside them, unbudgeted. Two sparrow motors were duly trimmed to fit 16
+    CPUs and then competed with a PS process helping itself to all 16 — so every engine ran slower than
+    its wall-clock time budget assumed, and the race compared engines that had each been handicapped by
+    an unknown amount. A comparison under unequal, unmeasured conditions is not a comparison.
+
+    Three outcomes:
+      * `requested` given and the binary accepts a thread flag -> pass it, reserve exactly that many;
+      * no explicit request but a flag exists -> ask for 1 (PS is the reference engine here, not the
+        subject) and reserve 1;
+      * no flag at all -> PS is uncontrollable. Reserve the whole machine and WARN, so the caller can
+        fall back to --sequential rather than silently produce a skewed race.
+    """
+    cpus = os.cpu_count() or 1
+    if help_text is None:
+        try:
+            h = subprocess.run([os.path.abspath(binary), '--help'], capture_output=True, text=True, timeout=20)
+            help_text = (h.stdout or '') + (h.stderr or '')
+        except (OSError, subprocess.SubprocessError):
+            help_text = ''
+    flag = next((f for f in PS_THREAD_FLAGS if f in help_text), None)
+    if flag is None:
+        return [], cpus, ('PackingSolver exposes no thread-limit flag in --help, so its CPU use cannot be '
+                          'bounded; assuming it takes all %d CPUs. Run with --sequential (or pass '
+                          '--ps-threads if your build does support one) for a fair comparison.' % cpus)
+    n = requested if requested and requested > 0 else 1
+    n = max(1, min(n, cpus))
+    return [flag, str(n)], n, None
+
+def cpu_budget(n_engines_concurrent, parallel_runs, cpus=None, workers=None, reserved=0):
     """(parallel_runs, warning) — keep engines x runs x workers within the CPU count.
 
     Each sparrow -p run spawns its own separator workers (3 by default, SPARROW_N_WORKERS overrides), so a
@@ -341,6 +391,9 @@ def cpu_budget(n_engines_concurrent, parallel_runs, cpus=None, workers=None):
     They do not go faster; they thrash, and the wall-clock time budget each engine was given is then spent
     on context switching. Reduce -p until the product fits, never below 1 (one run per engine is the
     minimum unit of work; if even that overcommits, there is nothing left to cut).
+
+    `reserved` is CPU count already spoken for by an engine this function cannot tune — in practice
+    PackingSolver, see ps_thread_limit(). It comes off the top before the sparrow engines are budgeted.
     """
     cpus = cpus or os.cpu_count() or 1
     if workers is None:
@@ -352,8 +405,11 @@ def cpu_budget(n_engines_concurrent, parallel_runs, cpus=None, workers=None):
                 if v > 0: workers = v
             except ValueError:
                 pass
+    # At least one CPU has to remain for the sparrow engines, however greedy the reservation.
+    budget = max(1, cpus - max(0, reserved))
     total = n_engines_concurrent * parallel_runs * workers
-    if total <= cpus: return parallel_runs, None
+    if total <= budget: return parallel_runs, None
+    cpus = budget
     allowed = max(1, cpus // max(1, n_engines_concurrent * workers))
     if allowed >= parallel_runs: return parallel_runs, None
     warn = (f'CPU budget: {n_engines_concurrent} concurrent engine(s) x -p {parallel_runs} x {workers} workers/run '
@@ -384,21 +440,87 @@ def result_as_bpp(res):
 # ---------------------------------------------------------------- run, select, write
 funcs = {'sheets': engine_sheets, 'bpp': engine_bpp, 'ps': engine_ps}
 
-def write_result(best):
-    res = {'instance': name, 'sheet': {'width': W, 'height': H}, 'min_sep': a.min_sep, 'engine': best['engine'],
-           'n_sheets': best['n_sheets'],
-           'sheets': [{'index': p['sheet'], 'used_width': p['used_width'], 'density': p['density'], 'leftover_band': p['leftover_band'],
-                       'placements': [{'item_id': q['item_id'], 'rotation_deg': q['rotation_deg'], 'x': q['x'], 'y': q['y']} for q in best['placements'][p['sheet']]]}
-                      for p in best['sheets']]}
-    json.dump(res, open(os.path.join(a.out, 'result.json'), 'w'), indent=1)
-    return res
+def result_path():
+    return os.path.join(a.out, 'result.json')
+
+def summary_path():
+    return os.path.join(a.out, 'summary.json')
+
+def clear_previous_outputs():
+    """Delete the top-level result.json / summary.json before the race starts.
+
+    The per-engine directories were already wiped each run (fresh_dir), but the top-level result.json was
+    not, so a failed race left the PREVIOUS race's answer sitting there, byte-identical and undated. The
+    audit's scenario: race 1 succeeds; race 2 runs a different input through an engine that exits 0 and
+    writes nothing; race 2 reports ok=false and exits 1 — and result.json still holds race 1's layout for
+    race 1's parts. Anyone reading the directory afterwards, or any script consuming result.json, gets a
+    plausible answer to a question nobody asked.
+
+    Deleting up front makes the file's existence mean exactly one thing: THIS race produced it.
+    """
+    for p in (result_path(), summary_path()):
+        try: os.unlink(p)
+        except FileNotFoundError: pass
+        except OSError as exc: log(f'WARNING: could not remove {p}: {exc}')
+
+def build_result(best):
+    """The result.json content — built in memory, written only once it has been validated."""
+    return {'instance': name, 'sheet': {'width': W, 'height': H}, 'min_sep': a.min_sep, 'engine': best['engine'],
+            'n_sheets': best['n_sheets'],
+            'sheets': [{'index': p['sheet'], 'used_width': p['used_width'], 'density': p['density'], 'leftover_band': p['leftover_band'],
+                        'placements': [{'item_id': q['item_id'], 'rotation_deg': q['rotation_deg'], 'x': q['x'], 'y': q['y']} for q in best['placements'][p['sheet']]]}
+                       for p in best['sheets']]}
+
+def write_result_atomically(res):
+    """Write result.json via a temp file in the same directory + os.replace().
+
+    Two reasons for the dance. (1) The file is written only AFTER the final validation, so a rejected
+    result can never appear on disk — the old code wrote first and validated second, leaving the bad file
+    behind when the gate failed. (2) os.replace() is atomic within a filesystem, so a reader either sees
+    the previous state or the complete new file, never a half-written one.
+    """
+    d = os.path.dirname(result_path()) or '.'
+    fd, tmp = tempfile.mkstemp(prefix='.result-', suffix='.json', dir=d)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(res, f, indent=1)
+        os.replace(tmp, result_path())
+        tmp = None
+    finally:
+        if tmp is not None:
+            try: os.unlink(tmp)
+            except OSError: pass
+
+def unlink_result():
+    """Remove result.json on every failure path, so failure never leaves an answer behind."""
+    try: os.unlink(result_path())
+    except FileNotFoundError: pass
+    except OSError as exc: log(f'WARNING: could not remove {result_path()}: {exc}')
 
 def main():
-    global RACE_T0
+    global RACE_T0, PS_THREAD_ARGV
     log(f'{name}: {sum(it.get("demand",1) for it in inst["items"])} items, sheet {W}x{H}, min-sep {a.min_sep}, gap {GAP}, budget {a.time}s, engines {engines}')
-    # --sequential runs one engine at a time, so the budget only has to hold for a single engine.
+
+    # A previous race's answer must not survive this one; see clear_previous_outputs().
+    clear_previous_outputs()
+
+    # PackingSolver's CPU use, if it is in the race at all. Resolved from its own --help so the number
+    # the budget reserves is the number PS is actually told to use.
+    reserved = 0
+    if 'ps' in engines and a.packingsolver:
+        PS_THREAD_ARGV, reserved, ps_warn = ps_thread_limit(a.packingsolver, a.ps_threads)
+        if ps_warn:
+            log('WARNING: ' + ps_warn)
+            if not a.sequential:
+                log('falling back to --sequential so the engines do not fight over the CPU')
+                a.sequential = True
+        else:
+            log(f'PackingSolver limited to {reserved} thread(s) via {" ".join(PS_THREAD_ARGV)}')
+
+    # --sequential runs one engine at a time, so the budget only has to hold for a single engine — and
+    # nothing else is running beside it, so the PS reservation does not apply either.
     n_conc = 1 if a.sequential else len([e for e in engines if e in ('sheets', 'bpp')]) or 1
-    p, warn = cpu_budget(n_conc, a.parallel_runs)
+    p, warn = cpu_budget(n_conc, a.parallel_runs, reserved=0 if a.sequential else reserved)
     if warn: log('WARNING: ' + warn)
     a.parallel_runs = p
     RACE_T0 = time.time()
@@ -409,17 +531,23 @@ def main():
         else: log(f"{r['engine']:6s} FAILED: {r.get('error') or r.get('validator')} t={r.get('time',0):.0f}s")
     valid = [r for r in results if r.get('ok')]
     if not valid:
-        json.dump({'ok': False, 'results': results}, open(os.path.join(a.out, 'summary.json'), 'w'), indent=1, default=str); return 1
+        unlink_result()
+        json.dump({'ok': False, 'results': results}, open(summary_path(), 'w'), indent=1, default=str); return 1
     # leftover band compared in 5 mm steps so that sub-millimetre noise does not outrank internal gaps
     best = sorted(valid, key=lambda r: (r['n_sheets'], -round(r['last_band'] / 5.0), r['gaps_other'], r['time']))[0]
-    res = write_result(best)
-    # Last gate: the file we are about to declare good must itself validate.
+    # Built in memory and validated BEFORE anything is written: the last gate has to be able to stop the
+    # file from existing, which it cannot do if the file is already there.
+    res = build_result(best)
     ok, vline = validate_json(result_as_bpp(res), ['--min-sep', str(a.min_sep)], 'result')
+    if ok:
+        write_result_atomically(res)
+    else:
+        unlink_result()
     json.dump({'ok': ok, 'best': best['engine'], 'result_validated': ok, 'result_validator': vline,
                'results': [{k: v for k, v in r.items() if k != 'placements'} for r in results]},
-              open(os.path.join(a.out, 'summary.json'), 'w'), indent=1, default=str)
+              open(summary_path(), 'w'), indent=1, default=str)
     if not ok:
-        log(f'FATAL: the written result.json does NOT validate ({vline}) — refusing to report success'); return 1
+        log(f'FATAL: the winning result does NOT validate ({vline}) — refusing to report success, nothing written'); return 1
     log(f"BEST: {best['engine']} — {best['n_sheets']} sheets, last band {best['last_band']:.1f} mm → {os.path.join(a.out, 'result.json')}")
     return 0
 
@@ -580,6 +708,49 @@ def self_test():
         p, warn = cpu_budget(8, 4, cpus=2, workers=3)
         chk('-p never drops below 1', p == 1)
 
+        # ---- 5b. PackingSolver's CPU use is part of the budget, or the race says so out loud.
+        #          The audit's finding: two sparrow engines were trimmed to 12/16 workers while PS took
+        #          all 16 CPUs beside them, unbudgeted.
+        argv, reserved, warn_ps = ps_thread_limit('/nonexistent/ps', None, help_text='  --number-of-threads N   threads\n')
+        chk('a PS build with a thread flag is limited and counted',
+            argv == ['--number-of-threads', '1'] and reserved == 1 and warn_ps is None, f'{argv} reserved={reserved}')
+        argv, reserved, warn_ps = ps_thread_limit('/nonexistent/ps', 4, help_text='  --threads N\n')
+        chk('an explicit --ps-threads is honoured', argv == ['--threads', '4'] and reserved == 4, f'{argv}')
+        argv, reserved, warn_ps = ps_thread_limit('/nonexistent/ps', None, help_text='  --input FILE\n  --certificate FILE\n')
+        chk('a PS build with NO thread flag reserves the whole machine and warns',
+            argv == [] and reserved == (os.cpu_count() or 1) and warn_ps is not None, warn_ps)
+        # ...and that reservation really does squeeze the sparrow engines' -p.
+        p_res, warn_res = cpu_budget(2, 16, cpus=16, workers=3, reserved=8)
+        p_free, _ = cpu_budget(2, 16, cpus=16, workers=3, reserved=0)
+        chk('a reservation lowers the sparrow -p budget', p_res < p_free, f'-p {p_res} (reserved 8) < -p {p_free} (reserved 0)')
+        p_all, _ = cpu_budget(2, 16, cpus=16, workers=3, reserved=16)
+        chk('a total reservation still leaves -p 1, never 0', p_all == 1, f'-p {p_all}')
+
+        # ---- 5c. result.json / summary.json lifecycle.
+        #          The audit's scenario: race 1 succeeds; race 2 (different input, an engine that exits 0
+        #          and writes nothing) fails — and race 1's result.json is still sitting there, undated
+        #          and plausible. Anything reading the directory gets a confident answer to the wrong
+        #          question.
+        _configure(tmp, _square_inst('tiny', 40.0, 2), 100.0, 100.0, 'lifecycle', ['sheets'])
+        prev = {'instance': 'previous-race', 'n_sheets': 99}
+        with open(result_path(), 'w') as f: json.dump(prev, f)
+        with open(summary_path(), 'w') as f: json.dump({'ok': True}, f)
+        clear_previous_outputs()
+        chk("a previous race's result.json is removed at start", not os.path.exists(result_path()))
+        chk("a previous race's summary.json is removed at start", not os.path.exists(summary_path()))
+
+        # write_result_atomically() only ever produces a complete file, and unlink_result() removes it.
+        good_res = {'instance': 'tiny', 'n_sheets': 1, 'sheets': []}
+        write_result_atomically(good_res)
+        chk('the result is written atomically and reads back intact',
+            os.path.exists(result_path()) and json.load(open(result_path())) == good_res)
+        leftovers = [f for f in os.listdir(a.out) if f.startswith('.result-')]
+        chk('the atomic write leaves no temp file behind', not leftovers, str(leftovers))
+        unlink_result()
+        chk('unlink_result removes the file on a failure path', not os.path.exists(result_path()))
+        unlink_result()   # must be idempotent: a failure path may run when nothing was ever written
+        chk('unlink_result is idempotent', not os.path.exists(result_path()))
+
         # ---- 6. the final result.json re-validation catches a broken conversion.
         _configure(tmp, _square_inst('tiny', 40.0, 2), 100.0, 100.0, 'finalv', ['bpp'])
         good = {'instance': 'tiny', 'sheet': {'width': 100.0, 'height': 100.0}, 'n_sheets': 1,
@@ -590,6 +761,31 @@ def self_test():
         bad = json.loads(json.dumps(good)); bad['sheets'][0]['placements'][1]['x'] = 10.0   # 30 mm overlap
         ok, line = validate_json(result_as_bpp(bad), ['--min-sep', '0.0'], 'st')
         chk('an overlapping result.json is rejected', not ok, line)
+
+        # ---- 6b. ...and a rejected result is never WRITTEN. The old order was write-then-validate, so
+        #          the file the gate rejected stayed on disk under the name of the run's answer.
+        _configure(tmp, _square_inst('tiny', 40.0, 2), 100.0, 100.0, 'rejected', ['bpp'])
+        clear_previous_outputs()
+        ok, _ = validate_json(result_as_bpp(bad), ['--min-sep', '0.0'], 'st')
+        if ok:
+            write_result_atomically(bad)
+        else:
+            unlink_result()
+        chk('a result that fails the final gate is never written', (not ok) and not os.path.exists(result_path()))
+
+        # ---- 6c. an item with allowed_orientations [] must not sink the race. jagua reads [] as a fixed
+        #          0 degrees; the validator used to read it as "no orientation permitted", so BOTH engines'
+        #          legitimate output failed and the race exited 1 with no candidate at all.
+        empty_rot = _square_inst('tiny', 40.0, 2)
+        for it in empty_rot['items']:
+            it['allowed_orientations'] = []
+        _configure(tmp, empty_rot, 100.0, 100.0, 'emptyrot', ['bpp'])
+        a.sparrow_bpp = _fake_engine(os.path.join(tmp, 'emptyrot_engine'),
+                                     _bpp_out('tiny', empty_rot, [[(0, 0.0, 0.0), (0, 50.0, 0.0)]], 100.0, 100.0), 'tiny')
+        RACE_T0 = time.time()
+        r = safe_engine('bpp')
+        chk('allowed_orientations [] (fixed 0 degrees) does not fail validation',
+            r['ok'], r.get('error') or r.get('validator'))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

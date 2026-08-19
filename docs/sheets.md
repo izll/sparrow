@@ -528,6 +528,51 @@ cargo test --release  # debug assertions OFF — catches what release users actu
 Run **both**. Tests that specifically exercise release semantics are marked
 `#[cfg(not(debug_assertions))]` and only execute in the second.
 
+### The binary-level E2E suites
+
+`tests/audit_regression_tests.rs` and `tests/audit2_regression_tests.rs` do not test functions, they
+run the **actual CLI** and inspect its exit code and the files it left in `output/`. That is the only
+level at which the criticals both audits found are visible at all: every one of them was an *exit `0`
+that exported something wrong*, which no unit test on an internal function can see.
+
+Two properties of these suites are load-bearing, and both were previously wrong:
+
+* **They are not `#[ignore]`d.** Every case runs with `-e 0 -c 0`, so the whole group finishes in
+  well under a second and a plain `cargo test` runs it. The second audit's finding was that all ten
+  cases were ignored, so the documented `cargo test --release` executed none of them — a release
+  gate that nothing runs.
+* **The binary comes from `env!("CARGO_BIN_EXE_sparrow")`** (and `..._sparrow-bpp`), the path Cargo
+  defines for the binary built *for this test run*, in this profile and this target directory. The
+  previous code hardcoded `CARGO_MANIFEST_DIR/target/release/sparrow` and returned early when it did
+  not exist, which meant that under a custom `CARGO_TARGET_DIR` it tested a stale binary from an
+  older build — and with no binary present at all, every test passed having asserted nothing. A test
+  that is green because it did no work is worse than a missing test.
+
+Only the wall-clock assertions stay `#[ignore]`d — `e2e_pack_down_honours_the_time_budget` and
+`pack_down_moves_items_across_bins_on_iso6_with_a_long_budget` — because elapsed time is meaningless
+in a debug build and unreliable on a loaded machine. They are opt-in, not skipped:
+
+```bash
+cargo test --release -- --ignored
+```
+
+### The full gate: `scripts/ci.sh`
+
+All of the above, plus the two Python self-tests and clippy, in one fatal-on-first-failure script:
+
+```bash
+scripts/ci.sh
+```
+
+| Stage | Command | Catches |
+| --- | --- | --- |
+| 1 | `cargo test` | invariant violations, `debug_assert!`s live |
+| 2 | `cargo test --release` | release semantics — **including** both binary-level E2E suites |
+| 3 | `cargo test --release -- --ignored` | the wall-clock suites |
+| 4 | `scripts/validate_solution.py --self-test` | the independent geometric validator itself |
+| 5 | `scripts/nest_race.py --self-test` | engine selection, staleness, CPU budget, `result.json` lifecycle |
+| 6 | `cargo clippy --all-targets -- -D warnings` | lint regressions |
+
 ## SPP regression safety
 
 With `sheet = None` the behaviour is unchanged:

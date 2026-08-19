@@ -21,29 +21,20 @@
 
 use anyhow::{bail, Result};
 use jagua_rs::entities::Instance;
-use jagua_rs::geometry::geo_enums::RotationRange;
+use crate::util::rotations::{candidate_rotations, is_continuous};
 use jagua_rs::geometry::geo_traits::TransformableFrom;
 use jagua_rs::geometry::Transformation;
 use jagua_rs::probs::spp::entities::SPInstance;
 use ordered_float::OrderedFloat;
-use std::f32::consts::PI;
 
-/// Rotation grid used to test a continuously rotatable item, matching the one
-/// [`items_too_wide_for_sheet`](crate::optimizer::sheets::items_too_wide_for_sheet) and the
-/// placement sampler use.
-const ROT_N_SAMPLES: usize = 24;
-
-/// The rotations to test for an item: its allowed set, or a uniform grid for continuous rotation.
-fn rotations_of(item: &jagua_rs::entities::Item) -> Vec<f32> {
-    match &item.allowed_rotation {
-        RotationRange::None => vec![0.0],
-        RotationRange::Discrete(r) => r.clone(),
-        RotationRange::Continuous => (0..ROT_N_SAMPLES)
-            .map(|i| i as f32 * (2.0 * PI) / ROT_N_SAMPLES as f32)
-            .collect(),
-    }
-}
-
+/// The rotations to test for an item: **exactly** the grid the placement sampler uses
+/// ([`crate::util::rotations::candidate_rotations`]).
+///
+/// This used to be a private 24-step copy while the sampler used 16 steps. The two grids share only
+/// the multiples of 45°, so this gate rejected instances the engine can solve: the audit's 100 x 10
+/// rectangle pre-rotated by 22.5° fits a 10.2 mm strip at the sampler's -22.5°, but the nearest
+/// 24-step sample is 7.5° off and made the minimum height 23 mm. See `crate::util::rotations`.
+///
 /// Items of `instance` that are **taller than the strip in every allowed rotation**, with that
 /// minimum height.
 ///
@@ -56,8 +47,8 @@ pub fn items_too_tall_for_strip(instance: &SPInstance) -> Vec<(usize, f32)> {
     instance.items.iter()
         .filter_map(|(item, _)| {
             let mut buffer = item.shape_cd.as_ref().clone();
-            let min_height = rotations_of(item).iter()
-                .map(|&r| {
+            let min_height = candidate_rotations(item)
+                .map(|r| {
                     let bbox = buffer
                         .transform_from(item.shape_cd.as_ref(), &Transformation::from_rotation(r))
                         .bbox;
@@ -66,7 +57,13 @@ pub fn items_too_tall_for_strip(instance: &SPInstance) -> Vec<(usize, f32)> {
                 .min()
                 .map(|h| h.0)
                 .unwrap_or(f32::INFINITY);
-            (min_height > height).then_some((item.id, min_height))
+            // A *continuous* item is only **sampled** on this grid — the engine can place it at any
+            // angle, including one strictly between two samples. So the grid can prove that such an
+            // item fits, never that it does not: for a continuous item this gate keeps quiet and
+            // lets the engine try. Rejecting one wrongly costs a solvable instance; passing one
+            // wrongly costs only a slower, still-reported failure downstream.
+            let reject = min_height > height && !is_continuous(item);
+            reject.then_some((item.id, min_height))
         })
         .collect()
 }

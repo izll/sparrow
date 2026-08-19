@@ -106,24 +106,13 @@ pub fn wall_intervals(width: f32, sheet: &SheetConfig) -> Vec<(f32, f32)> {
 pub fn items_too_wide_for_sheet(instance: &SPInstance, sheet: &SheetConfig) -> Vec<(usize, f32)> {
     use jagua_rs::geometry::Transformation;
     use jagua_rs::geometry::geo_traits::TransformableFrom;
-    use jagua_rs::geometry::geo_enums::RotationRange;
-    use std::f32::consts::PI;
-
-    // Same rotation grid as `UniformBBoxSampler` uses for continuous rotation.
-    const ROT_N_SAMPLES: usize = 24;
+    use crate::util::rotations::{candidate_rotations, is_continuous};
 
     instance.items.iter()
         .filter_map(|(item, _)| {
-            let rotations: Vec<f32> = match &item.allowed_rotation {
-                RotationRange::None => vec![0.0],
-                RotationRange::Discrete(r) => r.clone(),
-                RotationRange::Continuous => (0..ROT_N_SAMPLES)
-                    .map(|i| i as f32 * (2.0 * PI) / ROT_N_SAMPLES as f32)
-                    .collect(),
-            };
             let mut buffer = item.shape_cd.as_ref().clone();
-            let min_width = rotations.iter()
-                .map(|&r| {
+            let min_width = candidate_rotations(item)
+                .map(|r| {
                     let bbox = buffer
                         .transform_from(item.shape_cd.as_ref(), &Transformation::from_rotation(r))
                         .bbox;
@@ -132,7 +121,10 @@ pub fn items_too_wide_for_sheet(instance: &SPInstance, sheet: &SheetConfig) -> V
                 .min()
                 .map(|w| w.0)
                 .unwrap_or(f32::INFINITY);
-            (min_width > sheet.width).then_some((item.id, min_width))
+            // See `items_too_tall_for_strip`: for a *continuous* item the grid is a sample, so it
+            // can only ever prove that the item fits, never that it does not. Never reject one.
+            let reject = min_width > sheet.width && !is_continuous(item);
+            reject.then_some((item.id, min_width))
         })
         .collect()
 }
@@ -506,18 +498,11 @@ pub fn required_density_for(sep: &Separator, n_target: usize, sheet: &SheetConfi
 fn shrink_bbox_for_item(bbox: Rect, item: &jagua_rs::entities::Item) -> Option<Rect> {
     use jagua_rs::geometry::Transformation;
     use jagua_rs::geometry::geo_traits::TransformableFrom;
-    use jagua_rs::geometry::geo_enums::RotationRange;
-    use std::f32::consts::PI;
+    use crate::util::rotations::candidate_rotations;
 
-    // Same rotation grid the sampler uses for continuous rotation.
-    const ROT_N_SAMPLES: usize = 24;
-    let rotations: Vec<f32> = match &item.allowed_rotation {
-        RotationRange::None => vec![0.0],
-        RotationRange::Discrete(r) => r.clone(),
-        RotationRange::Continuous => (0..ROT_N_SAMPLES)
-            .map(|i| i as f32 * (2.0 * PI) / ROT_N_SAMPLES as f32)
-            .collect(),
-    };
+    // Exactly the grid the sampler draws from (`util::rotations`), so the window this deflation
+    // produces is valid for whichever rotation the sampler actually picks.
+    let rotations: Vec<f32> = candidate_rotations(item).collect();
 
     let mut buffer = item.shape_cd.as_ref().clone();
     // Worst-case offsets over the rotations: how far the shape reaches left/below its origin

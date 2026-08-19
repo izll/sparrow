@@ -91,7 +91,8 @@ pub fn compression_phase(
         // for the strip consolidation that turns the emptied bin's remainder into a single offcut.
         if config.pack_down && !term.kill() {
             let pack_down_term = share_of(term, config.pack_down_time_ratio, config.time_limit);
-            let (new_sol, n_moved) = pack_down(sep, &pack_down_term, config, sol_listener, instance);
+            let (new_sol, pd_stats) = pack_down(sep, &pack_down_term, config, sol_listener, instance);
+            let n_moved = pd_stats.n_moved;
             if n_moved > 0 {
                 best_sol = new_sol;
                 progress = true;
@@ -212,19 +213,48 @@ pub fn compression_phase(
 ///
 /// Returns the best (feasible) solution found **and how many items were moved across bins**; the
 /// separator is left on that solution.
+/// What one [`pack_down`] call did — the **observable** record of the loop, as opposed to the
+/// wall-clock symptoms of it.
+///
+/// `n_moved` alone made the phase untestable in the way it needed to be tested. The property that
+/// pack-down exists to guarantee is *"every open bin takes a turn as source"*; the property a test
+/// could previously observe was *"within N seconds the heuristic accepted at least one move"*, and
+/// those are not the same thing at all. The second depends on machine load and on whether a
+/// separation happened to converge inside its per-move budget, which is precisely why the iso6
+/// release test failed in a clean suite run and passed on an immediate isolated rerun with an
+/// identical density vector. `sources_visited` records the first, so a test can assert it.
+#[derive(Debug, Clone, Default)]
+pub struct PackDownStats {
+    /// Items moved across a bin border.
+    pub n_moved: usize,
+    /// Full passes over all sources.
+    pub n_passes: usize,
+    /// Every layout that was **taken as a source** — i.e. reached the point of having its items
+    /// enumerated for transfer — in visit order, with repeats across passes. Deterministic for a
+    /// given seed and config: the source order comes from `ordered_layouts`.
+    pub sources_visited: Vec<LayKey>,
+}
+
+impl PackDownStats {
+    /// The distinct layouts that took a turn as source.
+    pub fn distinct_sources(&self) -> std::collections::BTreeSet<LayKey> {
+        self.sources_visited.iter().copied().collect()
+    }
+}
+
 pub fn pack_down(
     sep: &mut BPSeparator,
     term: &impl Terminator,
     config: &BPCompressionConfig,
     sol_listener: &mut impl BPSolutionListener,
     instance: &BPInstance,
-) -> (BPSolution, usize) {
+) -> (BPSolution, PackDownStats) {
     let mut best_sol = sep.prob.save();
     debug_assert!(sep.total_loss() == 0.0, "pack_down must start from a feasible solution");
 
     if sep.prob.layouts.len() < 2 {
         info!("[BPCMPR] only one bin, nothing to pack down");
-        return (best_sol, 0);
+        return (best_sol, PackDownStats::default());
     }
 
     // Short, cheap separations: a pack-down attempt is a *local* repair (one extra item in one
@@ -234,6 +264,7 @@ pub fn pack_down(
 
     let mut n_moved = 0usize;
     let mut n_pass = 0usize;
+    let mut sources_visited: Vec<LayKey> = vec![];
     let start = Instant::now();
 
     // Full passes over *all* sources, repeated while a pass still moves something and time remains.
@@ -258,6 +289,8 @@ pub fn pack_down(
             }
             let src_density = sep.prob.layouts[src].density(&sep.instance);
             let moved_before_src = n_moved;
+            // Recorded here, past every `continue` above: this layout genuinely took its turn.
+            sources_visited.push(src);
 
             // Items of the source, largest original area first (ties by PItemKey → deterministic).
             let mut src_items = sep.prob.layouts[src].placed_items.keys().collect_vec();
@@ -419,7 +452,7 @@ pub fn pack_down(
            {:.1}s, {} bin(s), cost {}",
         start.elapsed().as_secs_f32(), sep.prob.layouts.len(), sep.prob.bin_cost());
 
-    (best_sol, n_moved)
+    (best_sol, PackDownStats { n_moved, n_passes: n_pass, sources_visited })
 }
 
 /// All open layouts ordered by density — ascending when `ascending`, descending otherwise.

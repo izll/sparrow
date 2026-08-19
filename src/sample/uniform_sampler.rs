@@ -1,4 +1,5 @@
 use itertools::Itertools;
+use crate::util::rotations::candidate_rotations;
 use jagua_rs::entities::Item;
 use jagua_rs::geometry::geo_enums::RotationRange;
 use jagua_rs::geometry::geo_traits::TransformableFrom;
@@ -7,10 +8,7 @@ use jagua_rs::geometry::{normalize_rotation, DTransformation, Transformation};
 use ordered_float::OrderedFloat;
 use rand::prelude::IndexedRandom;
 use rand::{Rng, RngExt};
-use std::f32::consts::PI;
 use std::ops::Range;
-
-const ROT_N_SAMPLES: usize = 16; // number of rotations to sample for continuous rotation
 
 /// A sampler that creates uniform samples for an item within a bounding box
 #[derive(Clone, Debug)]
@@ -28,17 +26,11 @@ struct RotEntry {
 
 impl UniformBBoxSampler {
     pub fn new(sample_bbox: Rect, item: &Item, container_bbox: Rect) -> Option<Self> {
-        let rotations = match &item.allowed_rotation {
-            RotationRange::None => &vec![0.0],
-            RotationRange::Discrete(r) => r,
-            RotationRange::Continuous => {
-                // for continuous rotation, we sample a set of rotations spaced evenly
-                let step = (2.0 * PI) / ROT_N_SAMPLES as f32;
-                &(0..ROT_N_SAMPLES)
-                    .map(|i| i as f32 * step)
-                    .collect_vec()
-            }
-        };
+        // The single shared rotation grid (`util::rotations`). It used to be defined here, with
+        // private 24-step copies in the packability and sheet pre-checks — grids that agree only on
+        // the multiples of 45°, so a pre-check could reject an instance the sampler solves. See
+        // `crate::util::rotations`.
+        let rotations = candidate_rotations(item).collect_vec();
 
         let mut shape_buffer = item.shape_cd.as_ref().clone();
 

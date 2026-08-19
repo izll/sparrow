@@ -7,12 +7,18 @@
 //! exists to stop were all of the same shape: a warm start (or a fallback path) that was never
 //! verified, exported with exit code `0`.
 //!
-//! Three independent properties are checked, in both problem variants:
+//! Four independent properties are checked, in both problem variants:
 //!
 //! 1. **Exact demand coverage per item id.** Not the total count — per id. A solution that places
 //!    two copies of item 3 and none of item 4 has the right total and is still wrong.
 //! 2. **Geometric feasibility**, via [`Layout::from_snapshot(..).is_feasible()`].
-//! 3. **Cuttability** (walled SPP only): no item's collision bbox may straddle a sheet wall.
+//! 3. **Allowed rotations.** Every placement's angle has to be one the item actually permits. This
+//!    is the one property that is *invisible to geometry*: a part placed at 45° when only 0° is
+//!    allowed can be perfectly collision-free and still be scrap, because `allowed_orientations`
+//!    is how a grain, a pattern or a laminate direction is expressed. The audit exported exactly
+//!    that at exit `0` — a warm start whose single placement carried a 45° rotation for an item
+//!    declared `allowed_orientations: [0.0]` — and only the Python validator caught it.
+//! 4. **Cuttability** (walled SPP only): no item's collision bbox may straddle a sheet wall.
 //!
 //! A violation is an `Err`, which both binaries turn into an exit code of `1` *before* any JSON is
 //! written. Failing loudly and writing nothing is the only safe answer: a layout with overlapping
@@ -78,6 +84,91 @@ pub fn bpp_placed(sol: &BPSolution) -> BTreeMap<usize, usize> {
     placed
 }
 
+/// Angular tolerance of the rotation gate, in **degrees**.
+///
+/// The exported/imported angles are `f32` and go through degree↔radian conversions on both sides, so
+/// exact equality is unusable: a nominal 180° round-trips as 179.99998. 1e-3° is four orders of
+/// magnitude below any rotation a human would declare and far above that noise. It matches
+/// `scripts/validate_solution.py`'s `ANGLE_TOL`, so the Rust gate and the independent validator
+/// agree on the boundary rather than disagreeing by a hair.
+pub const ROTATION_TOL_DEG: f32 = 1e-3;
+
+/// The same tolerance in radians, which is what the library's angles are in.
+pub const ROTATION_TOL_RAD: f32 = ROTATION_TOL_DEG * std::f32::consts::PI / 180.0;
+
+/// Checks every placement's rotation against the item's [`RotationRange`](jagua_rs::geometry::geo_enums::RotationRange).
+///
+/// `placements` yields `(item_id, rotation_in_radians, where)`, `where` naming the layout for the
+/// error message (`""` for the single-layout SPP case).
+///
+/// * `None` ⇒ the rotation must be 0° modulo 360°,
+/// * `Discrete(a)` ⇒ it must equal one of `a` modulo 360°,
+/// * `Continuous` ⇒ anything finite.
+///
+/// Modulo 360° is not a nicety: the engine exports the angle it happens to hold, and an item with
+/// `[0, 180]` is routinely written out as `-180`. A comparison without the wrap-around would reject
+/// correct solutions, which is how a gate gets disabled.
+fn check_rotations<'a>(
+    placements: impl Iterator<Item = (usize, f32, &'a str)>,
+    item_of: impl Fn(usize) -> Option<&'a jagua_rs::entities::Item>,
+    what: &str,
+) -> Result<()> {
+    use crate::util::rotations::{describe_allowed, rotation_is_allowed};
+
+    let mut bad: Vec<String> = vec![];
+    for (item_id, rotation, whereabouts) in placements {
+        let Some(item) = item_of(item_id) else {
+            bail!("{what} places an unknown item id {item_id}");
+        };
+        if !rotation_is_allowed(item, rotation, ROTATION_TOL_RAD) {
+            bad.push(format!(
+                "item {item_id}{whereabouts} at {:.3}° (allowed: {})",
+                rotation.to_degrees(),
+                describe_allowed(item)
+            ));
+            if bad.len() >= 8 {
+                break;
+            }
+        }
+    }
+    if !bad.is_empty() {
+        bail!(
+            "{what} places {} item(s) at a rotation the item does not allow: {}. \
+             An angle outside `allowed_orientations` is not a geometric defect — the layout can be \
+             perfectly collision-free — but it is unmanufacturable whenever the material has a \
+             grain or pattern direction, which is exactly why the item declares the list",
+            bad.len(),
+            bad.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// The rotation gate for an SPP solution. See [`check_rotations`].
+pub fn verify_spp_rotations(sol: &SPSolution, instance: &SPInstance, what: &str) -> Result<()> {
+    check_rotations(
+        sol.layout_snapshot.placed_items.iter()
+            .map(|(_, pi)| (pi.item_id, pi.d_transf.rotation(), "")),
+        |id| instance.items.get(id).map(|(item, _)| item),
+        what,
+    )
+}
+
+/// The rotation gate for a BPP solution. See [`check_rotations`].
+pub fn verify_bpp_rotations(sol: &BPSolution, instance: &BPInstance, what: &str) -> Result<()> {
+    let placements: Vec<(usize, f32, String)> = sol.layout_snapshots.iter()
+        .flat_map(|(lkey, ls)| {
+            ls.placed_items.iter()
+                .map(move |(_, pi)| (pi.item_id, pi.d_transf.rotation(), format!(" in layout {lkey:?}")))
+        })
+        .collect();
+    check_rotations(
+        placements.iter().map(|(id, r, w)| (*id, *r, w.as_str())),
+        |id| instance.items.get(id).map(|(item, _)| item),
+        what,
+    )
+}
+
 /// Ids of the items whose collision bbox **straddles a sheet wall** in a walled SPP solution.
 ///
 /// Empty for any cuttable layout. A non-empty result means the strip cannot be cut into physical
@@ -105,6 +196,8 @@ pub fn verify_spp_solution(
 ) -> Result<()> {
     check_demand(&spp_placed(sol), &spp_demand(instance), what)?;
 
+    verify_spp_rotations(sol, instance, what)?;
+
     if !Layout::from_snapshot(&sol.layout_snapshot).is_feasible() {
         bail!("{what} is not collision-free: items overlap each other, the strip border or a sheet wall");
     }
@@ -126,6 +219,8 @@ pub fn verify_spp_solution(
 /// stock.
 pub fn verify_bpp_solution(sol: &BPSolution, instance: &BPInstance, what: &str) -> Result<()> {
     check_demand(&bpp_placed(sol), &bpp_demand(instance), what)?;
+
+    verify_bpp_rotations(sol, instance, what)?;
 
     for (lkey, ls) in sol.layout_snapshots.iter() {
         if !Layout::from_snapshot(ls).is_feasible() {

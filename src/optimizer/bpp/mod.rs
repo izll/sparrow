@@ -41,6 +41,7 @@ use crate::optimizer::bpp::explore::exploration_phase;
 use crate::util::bpp_io::BPSolutionListener;
 use crate::util::listener::ReportType;
 use crate::util::terminator::Terminator;
+use anyhow::Context;
 use jagua_rs::Instant;
 use jagua_rs::entities::Instance;
 use jagua_rs::probs::bpp::entities::{BPInstance, BPProblem, BPSolution};
@@ -62,9 +63,12 @@ use rand::{Rng, RngExt, SeedableRng};
 /// The returned solution is guaranteed to be feasible (all layouts collision-free, all demand
 /// placed), as both phases only ever accept verified feasible solutions.
 ///
-/// # Panics
-/// Panics if no initial solution can be constructed (e.g. an item fits in no bin, or the bin stock
-/// is insufficient). The CLI is expected to validate the instance beforehand.
+/// # Errors
+/// Returns an `Err` if no initial solution can be constructed (an item fits in no bin, the bin
+/// stock is insufficient, ...). This used to be a `panic!`, which forced `bpp_main` to run a
+/// *separate* LBF + shelf probe up front purely to turn the abort into a message — and then
+/// `optimize_bpp` constructed the very same two solutions again. Returning the error makes the
+/// probe unnecessary, so the constructors run once per run instead of twice.
 pub fn optimize_bpp(
     instance: BPInstance,
     mut rng: Xoshiro256PlusPlus,
@@ -72,13 +76,13 @@ pub fn optimize_bpp(
     terminator: &mut impl Terminator,
     config: &BPConfig,
     initial_solution: Option<&BPSolution>,
-) -> BPSolution {
+) -> anyhow::Result<BPSolution> {
     let mut next_rng = || Xoshiro256PlusPlus::seed_from_u64(rng.next_u64());
 
     // --- 1. Initial solution -----------------------------------------------------------------
     let start_prob = match initial_solution {
         None => build_initial_problem(&instance, next_rng(), config.constructive)
-            .expect("[BPOPT] failed to construct an initial solution"),
+            .context("failed to construct an initial solution: the instance cannot be packed")?,
         Some(init_sol) => {
             info!("[BPOPT] warm starting from provided initial solution");
 
@@ -155,9 +159,11 @@ pub fn optimize_bpp(
 
     info!("[BPOPT] final solution: cost {}, dens {:.3}%",
         cmpr_sol.cost(&instance), cmpr_sol.density(&instance) * 100.0);
-    sol_listener.report(ReportType::Final, &cmpr_sol, &instance);
+    // No `ReportType::Final` here — see the SPP twin in `crate::optimizer::optimize`. The listener
+    // writes `output/final_<name>_bin*.svg`, and that must not happen until the caller's export
+    // gate has passed, or a rejected solution leaves behind SVGs that look like the answer.
 
-    cmpr_sol
+    Ok(cmpr_sol)
 }
 
 /// Builds the starting [`BPProblem`] with the configured constructive heuristic.

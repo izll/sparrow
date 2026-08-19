@@ -17,10 +17,11 @@ use log::{info, warn};
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::SeedableRng;
 use sparrow::config::{BPConfig, DEFAULT_BPP_CONFIG};
-use sparrow::consts::{DEFAULT_COMPRESS_TIME_RATIO, DEFAULT_EXPLORE_TIME_RATIO, DEFAULT_MAX_CONSEQ_FAILS_EXPL, LBF_SAMPLE_CONFIG, LOG_LEVEL_FILTER_DEBUG, LOG_LEVEL_FILTER_RELEASE};
-use sparrow::optimizer::bpp::{optimize_bpp, BPLBFBuilder, BPShelfBuilder};
+use sparrow::consts::{DEFAULT_COMPRESS_TIME_RATIO, DEFAULT_EXPLORE_TIME_RATIO, DEFAULT_MAX_CONSEQ_FAILS_EXPL, LOG_LEVEL_FILTER_DEBUG, LOG_LEVEL_FILTER_RELEASE};
+use sparrow::optimizer::bpp::optimize_bpp;
 use sparrow::util::bpp_io::{self, BPSolutionListener, BPSvgExporter, BppCli, ExtBPOutput};
 use sparrow::util::ctrlc_terminator::CtrlCTerminator;
+use sparrow::util::demand::total_demand;
 use sparrow::util::io;
 use sparrow::util::listener::ReportType;
 use sparrow::util::verify;
@@ -32,10 +33,6 @@ use std::time::Duration;
 pub const OUTPUT_DIR: &str = "output";
 
 pub const LIVE_DIR: &str = "data/live";
-
-/// Largest total demand accepted, mirroring the SPP binary's cap. See `sparrow`'s
-/// `MAX_TOTAL_DEMAND`.
-pub const MAX_TOTAL_DEMAND: u64 = 1_000_000;
 
 fn main() -> Result<()> {
     let mut config: BPConfig = DEFAULT_BPP_CONFIG;
@@ -113,14 +110,12 @@ fn main() -> Result<()> {
 
     let (ext_instance, ext_solution) = bpp_io::read_bpp_input(Path::new(&input_file_path), &args.bins)?;
 
-    // See `sparrow::MAX_TOTAL_DEMAND` on the SPP side: the BPP LBF constructor materialises one
-    // `Vec` element per demanded copy too, so a huge demand is an allocation, not a number.
-    let total_demand: u64 = ext_instance.items.iter().map(|it| it.demand).sum();
-    if total_demand > MAX_TOTAL_DEMAND {
-        bail!("the instance demands {total_demand} items, more than the supported maximum of \
-               {MAX_TOTAL_DEMAND}; every copy is materialised individually, so this would exhaust \
-               memory before the first placement");
-    }
+    // The same cap and the same overflow-safe sum the SPP binary uses — one implementation, in
+    // `util::demand`, because the BPP LBF constructor materialises one `Vec` element per demanded
+    // copy too, so a huge demand is an allocation, not a number.
+    let total_demand = total_demand(ext_instance.items.iter().map(|it| it.demand))
+        .context("the instance's demand is not supportable")?;
+    info!("[MAIN] total demand: {total_demand} item copies");
 
     // Minimum item separation: --min-sep > SPARROW_MIN_SEP env var > config default (shared with the SPP binary,
     // so both engines apply exactly the same inflation/deflation to identical inputs).
@@ -160,32 +155,23 @@ fn main() -> Result<()> {
         false => None,
     };
 
-    // `optimize_bpp` *panics* if it cannot construct an initial solution, so validate the instance
-    // once up front with the same LBF builder: it returns a proper `Err`, which becomes a CLI error.
-    if initial_solution.is_none() {
-        let probe_rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-        let probe = BPLBFBuilder::new(instance.clone(), probe_rng, LBF_SAMPLE_CONFIG).construct()
-            .context("the instance cannot be packed: no initial solution could be constructed")?;
-        info!("[MAIN] LBF probe: {} bin(s), cost: {}, density: {:.3}%",
-            probe.prob.layouts.len(), probe.prob.bin_cost(), probe.prob.density() * 100.0);
-        // The shelf constructor is only a *candidate* (see `Constructive::Best`), so a failure here
-        // is informational: `optimize_bpp` falls back to the LBF solution it just validated.
-        match BPShelfBuilder::new(instance.clone()).construct() {
-            Ok(shelf) => info!("[MAIN] shelf probe: {} bin(s), cost: {}, density: {:.3}%",
-                shelf.prob.layouts.len(), shelf.prob.bin_cost(), shelf.prob.density() * 100.0),
-            Err(e) => warn!("[MAIN] shelf probe failed: {e}"),
-        }
-    }
+    // No constructor probe here any more. It existed only because `optimize_bpp` used to *panic*
+    // when it could not build an initial solution, so the CLI ran an LBF (and a shelf) up front
+    // purely to turn that abort into a message — and `optimize_bpp` then built the very same two
+    // solutions again, doubling the construction work of every run. `optimize_bpp` now returns a
+    // `Result`, which becomes the CLI error directly, so the constructors run exactly once.
 
     // Set up the Ctrl-C handler once (before spawning any runs); CtrlCTerminator is multi-instance safe.
     let ctrlc_terminator = CtrlCTerminator::new();
 
     // Runs one complete optimization (seed `run_seed`) and returns its final solution
-    let run_optimization = |run_idx: usize, run_seed: u64| -> BPSolution {
+    let run_optimization = |run_idx: usize, run_seed: u64| -> Result<BPSolution> {
         let rng = Xoshiro256PlusPlus::seed_from_u64(run_seed);
         // Every run gets its own SVG exporter; the final SVGs are written by the main thread for the best run only.
+        // **No final path here** — see `main.rs`: the final SVGs go out only after the export
+        // gate, written by the main thread for the solution the gate accepts.
         let mut svg_exporter = BPSvgExporter::new(
-            if n_runs == 1 { Some(final_svg_path.clone()) } else { None },
+            None,
             intermediate_svg_dir.as_ref().map(|d| if n_runs == 1 { d.clone() } else { format!("{d}/run_{run_idx}") }),
             if run_idx == 0 { live_svg_dir.clone() } else { None },
         );
@@ -203,9 +189,10 @@ fn main() -> Result<()> {
 
     let solution = if n_runs == 1 {
         run_optimization(0, seed)
+            .context("the instance cannot be packed")?
     } else {
         // Run all optimizations concurrently on their own (named) threads and collect the results
-        let solutions: Vec<(usize, BPSolution)> = std::thread::scope(|scope| {
+        let solutions: Vec<(usize, Result<BPSolution>)> = std::thread::scope(|scope| {
             let handles = (0..n_runs)
                 .map(|run_idx| {
                     let run_optimization = &run_optimization;
@@ -226,6 +213,15 @@ fn main() -> Result<()> {
         // them, so a cost-only selection prefers it over every correct run.
         let mut feasible = vec![];
         for (run_idx, sol) in solutions.into_iter() {
+            // A run that could not even construct a start is not a crash of the whole program when
+            // other runs succeeded; it is one more excluded run.
+            let sol = match sol {
+                Ok(sol) => sol,
+                Err(e) => {
+                    warn!("[MAIN] run {} (seed {}) failed: {e:#}", run_idx, seed + run_idx as u64);
+                    continue;
+                }
+            };
             let verdict = verify::verify_bpp_solution(&sol, &instance, "the solution");
             info!("[MAIN] run {} (seed {}): {}{}", run_idx, seed + run_idx as u64,
                 bpp_io::summarize(&sol, &instance),
@@ -251,10 +247,6 @@ fn main() -> Result<()> {
             })
             .expect("the feasible list is non-empty");
         info!("[MAIN] best run: {} (seed {}), {}", best_idx, seed + best_idx as u64, bpp_io::summarize(&best_sol, &instance));
-
-        // Export the final SVGs of the best run
-        BPSvgExporter::new(Some(final_svg_path.clone()), None, None)
-            .report(ReportType::Final, &best_sol, &instance);
         best_sol
     };
 
@@ -264,10 +256,20 @@ fn main() -> Result<()> {
     // good JSON from a bad one, so the answer is fully re-verified (exact demand per item id,
     // per-layout collision-freedom, bin stock) immediately before the file is written. On failure
     // nothing is written and the process exits 1.
+    // Remove any final artefact an earlier run left in this directory before the gate runs, so a
+    // rejected run leaves nothing that reads as its answer. A BPP run writes one SVG per bin
+    // (`final_<name>_bin{i}.svg`), so the sweep is by prefix rather than by exact name.
+    let json_path = format!("{OUTPUT_DIR}/final_{}.json", ext_instance.name);
+    remove_stale_final_artefacts(Path::new(OUTPUT_DIR), &ext_instance.name);
+    let _ = fs::remove_file(&json_path);
+
     verify::verify_bpp_solution(&solution, &instance, "the final solution")
         .context("refusing to export")?;
 
-    let json_path = format!("{OUTPUT_DIR}/final_{}.json", ext_instance.name);
+    // Past the gate: publish the verified solution, SVGs first, JSON second.
+    BPSvgExporter::new(Some(final_svg_path.clone()), None, None)
+        .report(ReportType::Final, &solution, &instance);
+
     let json_output = ExtBPOutput {
         instance: ext_instance,
         solution: bpp_io::export_bp(&instance, &solution),
@@ -285,4 +287,23 @@ fn min_bin_density(sol: &BPSolution, instance: &jagua_rs::probs::bpp::entities::
     sol.layout_snapshots.values()
         .map(|ls| ls.density(instance))
         .fold(f32::INFINITY, f32::min)
+}
+
+/// Deletes every `final_{name}*.svg` in `dir`.
+///
+/// A BPP answer is not one file but one per bin, and the bin count changes from run to run: a run
+/// that ends with 3 bins after an earlier one ended with 9 would otherwise leave `_bin3..8` behind,
+/// six SVGs of a layout that is not the answer. Called before the export gate so that a rejected
+/// run leaves nothing at all, and before the successful write so the set is exactly this run's.
+fn remove_stale_final_artefacts(dir: &Path, instance_name: &str) {
+    let prefix = format!("final_{instance_name}");
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "svg")
+            && path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.starts_with(&prefix))
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }

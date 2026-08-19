@@ -13,6 +13,8 @@
 use crate::consts::DRAW_OPTIONS;
 use crate::util::io;
 use crate::util::listener::ReportType;
+use crate::util::rotations::{describe_allowed, rotation_is_allowed};
+use crate::util::verify;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use itertools::Itertools;
@@ -306,9 +308,22 @@ pub fn import_bp_solution(instance: &BPInstance, ext: &ExtBPSolution) -> Result<
                 bail!("layout {idx} places more copies of item {item_id} than the instance demands ({})",
                     instance.item_qty(item_id));
             }
+            // **Rotation gate**, applied *before* the placement is replayed. `place_item` records
+            // whatever angle it is handed, and `restore` trusts it, so a disallowed rotation in the
+            // warm start becomes a disallowed rotation in the exported answer — geometrically
+            // invisible (the layout can be perfectly collision-free) but unmanufacturable whenever
+            // the material has a grain direction. The audit's CRITICAL was exactly this JSON:
+            // `allowed_orientations: [0.0]` with a 45° placement, exported at exit 0.
+            let item = instance.item(item_id);
+            let ext_rot_deg = ext_placement.transformation.rotation;
+            if !rotation_is_allowed(item, ext_rot_deg.to_radians(), verify::ROTATION_TOL_RAD) {
+                bail!("layout {idx} places item {item_id} at {ext_rot_deg}°, which is not one of its \
+                       allowed orientations ({}); a warm start is replayed as-is, so this rotation \
+                       would be carried straight through to the exported solution",
+                    describe_allowed(item));
+            }
             let d_transf = {
                 let ext_transf = DTransformation::from(ext_placement.transformation.clone());
-                let item = instance.item(item_id);
                 ext_to_int_transformation(&ext_transf, &item.shape_orig.pre_transform)
             };
             // The first item opens the bin, the rest join the layout it created.
